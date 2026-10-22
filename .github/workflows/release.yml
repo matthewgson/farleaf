@@ -1,0 +1,76 @@
+# Push a tag like v0.1.0 to build farleaf for each platform, bundle it with
+# pdfium, and publish a GitHub release that install.sh downloads from.
+# Run it by hand (workflow_dispatch) to build without releasing.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: mac-arm64, os: macos-latest, target: aarch64-apple-darwin }
+          - { platform: mac-x64, os: macos-latest, target: x86_64-apple-darwin }
+          # Linux: zig links against glibc 2.17, so the binary runs on old systems too.
+          - { platform: linux-x64, os: ubuntu-latest, target: x86_64-unknown-linux-gnu, glibc: ".2.17" }
+          - { platform: linux-arm64, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, glibc: ".2.17" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup target add ${{ matrix.target }}
+      - name: Build
+        run: |
+          if [ -n "${{ matrix.glibc }}" ]; then
+            python3 -m venv "$RUNNER_TEMP/zig"
+            "$RUNNER_TEMP/zig/bin/pip" install -q cargo-zigbuild==0.24.0 ziglang==0.17.0
+            export PATH="$RUNNER_TEMP/zig/bin:$PATH"
+            cargo zigbuild --release --locked --target ${{ matrix.target }}${{ matrix.glibc }}
+          else
+            cargo build --release --locked --target ${{ matrix.target }}
+          fi
+      - name: Package
+        run: |
+          d=dist/farleaf-${{ matrix.platform }}
+          mkdir -p "$d/pdfium-licenses"
+          scripts/fetch-pdfium.sh ${{ matrix.platform }} "$RUNNER_TEMP/pdfium"
+          cp target/${{ matrix.target }}/release/farleaf "$RUNNER_TEMP"/pdfium/lib/libpdfium.* LICENSE README.md "$d/"
+          cp -R "$RUNNER_TEMP/pdfium/LICENSE" "$RUNNER_TEMP"/pdfium/licenses/* "$d/pdfium-licenses/"
+          tar -czf "$d.tar.gz" -C dist "farleaf-${{ matrix.platform }}"
+      - name: Smoke test
+        run: |
+          if [ ${{ matrix.platform }} = mac-x64 ] && ! arch -x86_64 /usr/bin/true 2>/dev/null; then
+            echo "no Rosetta on this runner; skipped"; exit 0
+          fi
+          python3 dev/sample_pdf.py "$RUNNER_TEMP/sample.pdf" 3
+          d=dist/farleaf-${{ matrix.platform }}
+          "$d/farleaf" --version
+          FARLEAF_BENCH_WIDTH=800 "$d/farleaf" --bench "$RUNNER_TEMP/sample.pdf"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: farleaf-${{ matrix.platform }}
+          path: dist/farleaf-${{ matrix.platform }}.tar.gz
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - run: cd dist && sha256sum *.tar.gz > SHA256SUMS && cat SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
+            --title "farleaf $GITHUB_REF_NAME" --generate-notes

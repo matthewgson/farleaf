@@ -1,0 +1,23 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      - name: Render a sample PDF
+        run: |
+          scripts/fetch-pdfium.sh
+          python3 dev/sample_pdf.py sample.pdf 3
+          FARLEAF_BENCH_WIDTH=800 cargo run --release --locked -- --bench sample.pdf
