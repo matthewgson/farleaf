@@ -229,10 +229,8 @@ impl Page {
             let stride = (f().bmp_stride)(bmp) as usize;
             let buf = std::slice::from_raw_parts((f().bmp_buffer)(bmp) as *const u8, stride * h);
             for (src, dst) in buf.chunks_exact(stride).zip(out.chunks_exact_mut(w * 3)) {
-                for (s, d) in src[..w * 3].chunks_exact(3).zip(dst.chunks_exact_mut(3)) {
-                    d[0] = s[2];
-                    d[1] = s[1];
-                    d[2] = s[0];
+                for (&[b, g, r], d) in src[..w * 3].as_chunks::<3>().0.iter().zip(dst.as_chunks_mut::<3>().0) {
+                    *d = [r, g, b];
                 }
             }
             (f().bmp_destroy)(bmp);

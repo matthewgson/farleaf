@@ -164,9 +164,9 @@ fn chunked(out: &mut Vec<u8>, ctl: &str, data: &[u8]) {
 
 fn base64(out: &mut Vec<u8>, data: &[u8]) {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut it = data.chunks_exact(3);
-    for c in &mut it {
-        let n = (c[0] as u32) << 16 | (c[1] as u32) << 8 | c[2] as u32;
+    let (chunks, rest) = data.as_chunks::<3>();
+    for &[a, b, c] in chunks {
+        let n = (a as u32) << 16 | (b as u32) << 8 | c as u32;
         out.extend_from_slice(&[
             T[(n >> 18) as usize],
             T[(n >> 12 & 63) as usize],
@@ -174,7 +174,7 @@ fn base64(out: &mut Vec<u8>, data: &[u8]) {
             T[(n & 63) as usize],
         ]);
     }
-    match *it.remainder() {
+    match *rest {
         [a] => {
             let n = (a as u32) << 16;
             out.extend_from_slice(&[T[(n >> 18) as usize], T[(n >> 12 & 63) as usize], b'=', b'=']);
@@ -205,7 +205,7 @@ fn zlib(data: &[u8]) -> Vec<u8> {
 /// almost never pure gray (antialiasing leaves a few tinted pixels), but half
 /// to three quarters of strips are, and those come out about 3x smaller.
 pub fn png(rgb: &[u8], w: u32, h: u32) -> Vec<u8> {
-    let gray = rgb.chunks_exact(3).all(|p| p[0] == p[1] && p[1] == p[2]);
+    let gray = rgb.as_chunks::<3>().0.iter().all(|&[r, g, b]| r == g && g == b);
     let row = w as usize * if gray { 1 } else { 3 };
     let mut raw = Vec::with_capacity((row + 1) * h as usize);
     for src in rgb.chunks_exact(w as usize * 3) {
