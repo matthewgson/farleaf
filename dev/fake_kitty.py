@@ -12,6 +12,9 @@ scripted keys, and saves what the screen would show as PNGs.
 ^X for Ctrl+X), TIME:snap:NAME (save DIR/NAME.png) and TIME:resize:COLSxROWS. --shm makes the
 terminal read POSIX shared memory (t=s), like a local Ghostty.
 
+Snapshots show only the images, unless Pillow is installed: then the text is
+drawn too, in its colors (FAKE_KITTY_FONT picks the font file).
+
 It enforces what Ghostty enforces, so a test fails where Ghostty would show
 nothing: images over 10000 px on a side are refused, and stored images are
 evicted beyond 320 MB (unplaced ones first, oldest first). Errors are
@@ -114,6 +117,9 @@ class Term:
         self.images, self.places, self.loading = {}, {}, None
         self.cur = (0, 0)
         self.grid = [[" "] * cols for _ in range(rows)]
+        # Each cell's colors and weight: (fg, bg, bold, dim); None is the default color.
+        self.attr = DEFAULT_ATTR
+        self.attrs = [[DEFAULT_ATTR] * cols for _ in range(rows)]
         self.stats = {"bytes": 0, "uploads": 0, "upload_bytes": 0, "places": 0, "deletes": 0, "frames": 0,
                       "refused": 0, "evicted": 0, "missing_places": 0, "peak_mem": 0}
         self.replies = []
@@ -126,6 +132,7 @@ class Term:
     def resize(self, cols, rows):
         self.cols, self.rows = cols, rows
         self.grid = [[" "] * cols for _ in range(rows)]
+        self.attrs = [[DEFAULT_ATTR] * cols for _ in range(rows)]
 
     def reply(self, kv, msg):
         q = kv.get("q", "0")
@@ -286,7 +293,8 @@ class Term:
     def snapshot(self, path):
         cw, ch = self.cw, self.ch
         W, H = self.cols * cw, self.rows * ch
-        fb = bytearray(b"\x1e" * (W * H * 3))
+        text = render_text(self)
+        fb = bytearray(text if text is not None else b"\x1e" * (W * H * 3))
         for (i, _), ((row, col), kv) in self.places.items():
             img = self.images.get(i)
             if img is None:
@@ -368,10 +376,13 @@ class Term:
                 return data[i:]
             if c >= 0x20:
                 ln = 1 if c < 0x80 else 2 if c < 0xe0 else 3 if c < 0xf0 else 4
+                if i + ln > n:
+                    return data[i:]  # a character split across reads: wait for the rest
                 ch_ = data[i:i + ln].decode("utf-8", "replace")
                 r, cc = self.cur
                 if r < self.rows and cc < self.cols:
                     self.grid[r][cc] = ch_
+                    self.attrs[r][cc] = self.attr
                 self.cur = (r, cc + 1)
                 i += ln
                 continue
@@ -384,8 +395,12 @@ class Term:
             self.cur = ((nums[0] if nums else 1) - 1, (nums[1] if len(nums) > 1 else 1) - 1)
         elif final == "J" and nums[:1] == [2]:
             self.grid = [[" "] * self.cols for _ in range(self.rows)]
+            self.attrs = [[DEFAULT_ATTR] * self.cols for _ in range(self.rows)]
         elif final == "K":
             self.grid[min(self.cur[0], self.rows - 1)] = [" "] * self.cols
+            self.attrs[min(self.cur[0], self.rows - 1)] = [DEFAULT_ATTR] * self.cols
+        elif final == "m" and not params.startswith(("?", ">")):
+            self.attr = sgr(self.attr, nums or [0])
         elif final == "t" and nums[:1] == [16]:
             self.replies.append(f"\x1b[6;{self.ch};{self.cw}t".encode())
         elif final == "q" and params.startswith(">") and self.xtversion:
@@ -394,6 +409,134 @@ class Term:
             self.replies.append(b"\x1b[?62;22c")
         elif final == "h" and params == "?2026":
             self.stats["frames"] += 1
+
+
+DEFAULT_ATTR = (None, None, False, False)
+
+
+def color256(n):
+    if n < 16:
+        base = [(0, 0, 0), (205, 49, 49), (13, 188, 121), (229, 229, 16), (36, 114, 200), (188, 63, 188),
+                (17, 168, 205), (229, 229, 229), (102, 102, 102), (241, 76, 76), (35, 209, 139), (245, 245, 67),
+                (59, 142, 234), (214, 112, 214), (41, 184, 219), (255, 255, 255)]
+        return base[n]
+    if n < 232:
+        n -= 16
+        steps = [0, 95, 135, 175, 215, 255]
+        return steps[n // 36], steps[n // 6 % 6], steps[n % 6]
+    v = 8 + (n - 232) * 10
+    return v, v, v
+
+
+def sgr(attr, nums):
+    """The attributes after SGR parameters `nums`."""
+    fg, bg, bold, dim = attr
+    i = 0
+    while i < len(nums):
+        n = nums[i]
+        if n == 0:
+            fg, bg, bold, dim = DEFAULT_ATTR
+        elif n == 1:
+            bold = True
+        elif n == 2:
+            dim = True
+        elif n == 22:
+            bold = dim = False
+        elif n in (38, 48) and i + 1 < len(nums):
+            if nums[i + 1] == 5 and i + 2 < len(nums):
+                c, i = color256(nums[i + 2]), i + 2
+            elif nums[i + 1] == 2 and i + 4 < len(nums):
+                c, i = tuple(nums[i + 2:i + 5]), i + 4
+            else:
+                c = None
+            if n == 38:
+                fg = c
+            else:
+                bg = c
+        elif n == 39:
+            fg = None
+        elif n == 49:
+            bg = None
+        elif 30 <= n <= 37 or 90 <= n <= 97:
+            fg = color256(n - 30 if n < 90 else n - 82)
+        elif 40 <= n <= 47 or 100 <= n <= 107:
+            bg = color256(n - 40 if n < 100 else n - 92)
+        i += 1
+    return fg, bg, bold, dim
+
+
+TEXT_FG, TEXT_BG = (208, 208, 208), (30, 30, 30)
+_fonts = {}
+
+
+def _font(size, bold):
+    from PIL import ImageFont
+    key = (size, bold)
+    if key not in _fonts:
+        home = os.path.expanduser("~")
+        paths = [os.environ.get("FAKE_KITTY_FONT", ""),
+                 f"{home}/Library/Fonts/JetBrainsMono-{'Bold' if bold else 'Regular'}.ttf",
+                 "/System/Library/Fonts/Menlo.ttc", "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"]
+        if bold and paths[0]:
+            paths.insert(1, paths[0].replace("Regular", "Bold"))
+        for p in paths:
+            if p and os.path.exists(p):
+                try:
+                    _fonts[key] = ImageFont.truetype(p, size)
+                    break
+                except OSError:
+                    continue
+        else:
+            _fonts[key] = ImageFont.load_default()
+    return _fonts[key]
+
+
+def render_text(term):
+    """The screen's text as RGB bytes, or None without Pillow."""
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        return None
+    cw, ch = term.cw, term.ch
+    img = Image.new("RGB", (term.cols * cw, term.rows * ch), TEXT_BG)
+    d = ImageDraw.Draw(img)
+    size = max(6, int(ch * 0.8))
+    while size > 6 and _font(size, False).getlength("M") > cw:
+        size -= 1
+    for r in range(term.rows):
+        for c in range(term.cols):
+            fg, bg, bold, dim = term.attrs[r][c]
+            x, y = c * cw, r * ch
+            if bg is not None:
+                d.rectangle([x, y, x + cw - 1, y + ch - 1], fill=bg)
+            g = term.grid[r][c]
+            if g == " ":
+                continue
+            col = fg or TEXT_FG
+            if dim:
+                base = bg or TEXT_BG
+                col = tuple((a + b) // 2 for a, b in zip(col, base))
+            if not draw_box(d, g, x, y, cw, ch, col):
+                d.text((x, y + ch // 2), g, font=_font(size, bold), fill=col, anchor="lm")
+    return img.tobytes()
+
+
+def draw_box(d, g, x, y, cw, ch, col):
+    """Box-drawing characters as lines that meet across cells, as terminals draw them."""
+    arms = {"─": "lr", "│": "ud", "┌": "rd", "┐": "ld", "└": "ru", "┘": "lu"}.get(g)
+    if arms is None:
+        return False
+    mx, my = x + cw // 2, y + ch // 2
+    for a in arms:
+        if a == "l":
+            d.line([x, my, mx, my], fill=col)
+        elif a == "r":
+            d.line([mx, my, x + cw, my], fill=col)
+        elif a == "u":
+            d.line([mx, y, mx, my], fill=col)
+        elif a == "d":
+            d.line([mx, my, mx, y + ch], fill=col)
+    return True
 
 
 def keybytes(s):

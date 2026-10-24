@@ -10,8 +10,8 @@ word in the PDF, for the search step; --scanned adds cases with a scanned PDF.
 Each case starts farleaf in dev/fake_kitty.py (directly, or in a throwaway
 herdr session running inside it) and walks through a reading session: page
 turns, scrolling, jumps, zoom and pan, fit modes, inversion, search, window
-resizes, the key list popup, key-repeat bursts, and a reload while the
-file changes. After every
+resizes, the key list popup, the sidebar (thumbnails and outline), key-repeat
+bursts, and a reload while the file changes. After every
 step it checks that the screen shows exactly what farleaf drew, image for
 image and pixel for pixel; and it times how long the screen took to stop
 changing. Results go to OUT/results.json and OUT/summary.md.
@@ -72,6 +72,13 @@ def session_steps(search, reload_fn, geom):
     key("i", "l", "i")
     key(f"/{search}\\r", "n", "n", "N", "\\e")
     key("?", "j", "G", "?")
+    # The sidebar: thumbnails (preview two pages on, go there), again (to the
+    # end, then back), the outline instead, fit modes beside it, then hide it.
+    key("t", "j", "j", "\\r")
+    key("t", "G", "\\e")
+    key("o", "j", "j", "\\r")
+    key("z", "Z", "?", "?")
+    key("o", "o")
     st.append(("resize", small))
     key("j")
     st.append(("resize", (cols, rows)))
@@ -113,6 +120,8 @@ def kind(name):
         return "search"
     if n == "?":
         return "help"
+    if n in ("t", "o", "\r"):
+        return "sidebar"
     if n.startswith("resize"):
         return "resize"
     return "other"
@@ -264,7 +273,8 @@ def main():
 
 
 def write_summary(results, path, farleaf):
-    kinds = ["open", "page", "scroll", "jump", "view", "pan", "search", "help", "resize", "burst", "reload"]
+    kinds = ["open", "page", "scroll", "jump", "view", "pan", "search", "help", "sidebar", "resize", "burst",
+             "reload"]
     out = [f"# farleaf stress test\n\n`{farleaf}`, {time.strftime('%Y-%m-%d %H:%M')}\n",
            "Checks: after every step, the screen is exactly what farleaf drew. "
            "Times: median / worst seconds from the key until the screen stopped changing.\n",

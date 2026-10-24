@@ -1,4 +1,4 @@
-//! Minimal runtime binding to pdfium: only the ~20 functions farleaf calls.
+//! Minimal runtime binding to pdfium: only the ~30 functions farleaf calls.
 //!
 //! pdfium is not thread-safe. Only the render worker (src/worker.rs) touches
 //! it, so nothing here locks.
@@ -36,6 +36,14 @@ struct Fns {
     find_close: unsafe extern "C" fn(H),
     count_rects: unsafe extern "C" fn(H, c_int, c_int) -> c_int,
     get_rect: unsafe extern "C" fn(H, c_int, *mut f64, *mut f64, *mut f64, *mut f64) -> c_int,
+    bm_first_child: unsafe extern "C" fn(H, H) -> H,
+    bm_next_sibling: unsafe extern "C" fn(H, H) -> H,
+    bm_title: unsafe extern "C" fn(H, *mut c_void, c_ulong) -> c_ulong,
+    bm_dest: unsafe extern "C" fn(H, H) -> H,
+    bm_action: unsafe extern "C" fn(H) -> H,
+    action_dest: unsafe extern "C" fn(H, H) -> H,
+    dest_page: unsafe extern "C" fn(H, H) -> c_int,
+    dest_location: unsafe extern "C" fn(H, *mut c_int, *mut c_int, *mut c_int, *mut f32, *mut f32, *mut f32) -> c_int,
 }
 
 struct Pdfium {
@@ -149,6 +157,14 @@ unsafe fn bind(lib: &Library) -> Result<Fns, libloading::Error> {
         find_close: sym!("FPDFText_FindClose"),
         count_rects: sym!("FPDFText_CountRects"),
         get_rect: sym!("FPDFText_GetRect"),
+        bm_first_child: sym!("FPDFBookmark_GetFirstChild"),
+        bm_next_sibling: sym!("FPDFBookmark_GetNextSibling"),
+        bm_title: sym!("FPDFBookmark_GetTitle"),
+        bm_dest: sym!("FPDFBookmark_GetDest"),
+        bm_action: sym!("FPDFBookmark_GetAction"),
+        action_dest: sym!("FPDFAction_GetDest"),
+        dest_page: sym!("FPDFDest_GetDestPageIndex"),
+        dest_location: sym!("FPDFDest_GetLocationInPage"),
     })
 }
 
@@ -192,6 +208,61 @@ impl Doc {
             .collect()
     }
 
+    /// The document outline (bookmarks), depth first. Malformed outlines
+    /// (loops, absurd sizes) are cut short rather than trusted.
+    pub fn outline(&self, sizes: &[(f32, f32)]) -> Vec<Entry> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![(unsafe { (f().bm_first_child)(self.h, std::ptr::null_mut()) }, 0u32)];
+        while let Some((bm, depth)) = stack.pop() {
+            if bm.is_null() || out.len() >= 20_000 || !seen.insert(bm as usize) {
+                continue;
+            }
+            // Siblings after this entry's children: push the sibling first.
+            stack.push((unsafe { (f().bm_next_sibling)(self.h, bm) }, depth));
+            if depth < 32 {
+                stack.push((unsafe { (f().bm_first_child)(self.h, bm) }, depth + 1));
+            }
+            let (page, frac) = self.target(bm, sizes).map_or((None, 0.0), |(p, y)| (Some(p), y));
+            out.push(Entry {
+                title: unsafe { title(bm) },
+                depth,
+                page,
+                frac,
+            });
+        }
+        out
+    }
+
+    /// Where bookmark `bm` goes: a page, and how far down it (0 = top).
+    fn target(&self, bm: H, sizes: &[(f32, f32)]) -> Option<(usize, f32)> {
+        unsafe {
+            let mut dest = (f().bm_dest)(self.h, bm);
+            if dest.is_null() {
+                let action = (f().bm_action)(bm);
+                if action.is_null() {
+                    return None;
+                }
+                dest = (f().action_dest)(self.h, action);
+                if dest.is_null() {
+                    return None;
+                }
+            }
+            let page = usize::try_from((f().dest_page)(self.h, dest)).ok()?;
+            let h = sizes.get(page)?.1;
+            let (mut has_x, mut has_y, mut has_zoom) = (0, 0, 0);
+            let (mut x, mut y, mut zoom) = (0.0f32, 0.0f32, 0.0f32);
+            let ok = (f().dest_location)(dest, &mut has_x, &mut has_y, &mut has_zoom, &mut x, &mut y, &mut zoom);
+            // PDF y runs up from the bottom of the page.
+            let frac = if ok != 0 && has_y != 0 {
+                (1.0 - y / h).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            Some((page, frac))
+        }
+    }
+
     pub fn page(&self, index: usize) -> Option<Page> {
         let h = unsafe { (f().load_page)(self.h, index as c_int) };
         (!h.is_null()).then_some(Page { h })
@@ -202,6 +273,29 @@ impl Drop for Doc {
     fn drop(&mut self) {
         unsafe { (f().close_doc)(self.h) }
     }
+}
+
+/// One outline entry: its title, nesting depth (0 = top level), and where
+/// it goes, if that can be resolved.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Entry {
+    pub title: String,
+    pub depth: u32,
+    pub page: Option<usize>,
+    pub frac: f32,
+}
+
+/// A bookmark's title (UTF-16LE in pdfium), on one line.
+unsafe fn title(bm: H) -> String {
+    let n = (f().bm_title)(bm, std::ptr::null_mut(), 0) as usize;
+    if n < 2 {
+        return String::new();
+    }
+    let mut buf = vec![0u16; n / 2];
+    (f().bm_title)(bm, buf.as_mut_ptr().cast(), (buf.len() * 2) as c_ulong);
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    let t = String::from_utf16_lossy(&buf[..end]);
+    t.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 pub struct Page {

@@ -31,11 +31,13 @@ fn debug_crc(rgb: &[u8]) -> u32 {
 mod encode;
 mod layout;
 mod pdfium;
+mod sidebar;
 mod term;
 mod worker;
 
 use encode::Transport;
 use layout::{Fit, Geom, Layout, Rect, Visible};
+use sidebar::{Kind, ThumbAt, Thumbs};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::os::fd::RawFd;
@@ -44,7 +46,7 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use term::{Input, Key, Parser, Tty};
-use worker::{Event, Job, StripJob, StripKey, Worker, Writer};
+use worker::{DocInfo, Event, Job, StripJob, StripKey, Worker, Writer};
 
 /// Every key, for the help popup (`?`) and --help. A row without keys
 /// starts a section.
@@ -70,6 +72,10 @@ const KEYS: &[(&str, &str)] = &[
     ("m{a-z}  '{a-z}", "set mark / go to mark"),
     ("''", "back to before the last jump"),
     ("Ctrl-o  Tab", "older / newer place in the jump list"),
+    ("", "Sidebar"),
+    ("o", "outline (contents); again to hide"),
+    ("t", "page thumbnails; again to hide"),
+    ("j k  Enter  Esc", "in the sidebar: move, go there, go back"),
     ("", "Other"),
     ("r  :e", "reload (automatic when the file changes)"),
     ("?  :help", "this list"),
@@ -237,9 +243,9 @@ fn run(path: PathBuf, start_page: Option<usize>) -> Result<(), String> {
     let budget = if herdr { HERDR_BUDGET } else { GHOSTTY_BUDGET };
 
     // The document has been loading on the worker while we probed.
-    let sizes = loop {
+    let info = loop {
         match rx.recv() {
-            Ok(Event::Doc(Ok(sizes))) if !sizes.is_empty() => break sizes,
+            Ok(Event::Doc(Ok(info))) if !info.sizes.is_empty() => break info,
             Ok(Event::Doc(Ok(_))) => {
                 term::leave();
                 return Err(format!("{}: the PDF has no pages", path.display()));
@@ -258,7 +264,7 @@ fn run(path: PathBuf, start_page: Option<usize>) -> Result<(), String> {
     let out = tty.file.try_clone().map_err(|e| e.to_string())?;
     let writer = Writer::spawn(out, tx, wake_w);
     let mut app = App::new(
-        tty, wake_r, rx, worker, writer, transport, budget, path, sizes, probe.cell,
+        tty, wake_r, rx, worker, writer, transport, budget, path, info, probe.cell,
     );
     if let Some(p) = start_page {
         app.goto_page(p.saturating_sub(1), false);
@@ -310,6 +316,24 @@ struct Pos {
     frac: f32,
 }
 
+/// The open sidebar: what it lists, the first item on screen, and, while it
+/// has the keys, the selected item and where the view was before (Esc goes
+/// back there).
+struct Side {
+    kind: Kind,
+    first: usize,
+    focus: Option<Focus>,
+    /// The outline entry last gone to, and the view's top then: it stays the
+    /// current one until the view moves.
+    chosen: Option<(usize, u32)>,
+}
+
+struct Focus {
+    sel: usize,
+    origin: Pos,
+    origin_left: u32,
+}
+
 #[derive(Default)]
 struct Search {
     needle: String,
@@ -334,6 +358,12 @@ struct App {
     path: PathBuf,
     name: String,
     sizes: Vec<(f32, f32)>,
+    outline: Vec<pdfium::Entry>,
+    side: Option<Side>,
+    /// Thumbnail sizes for the sidebar (set by relayout).
+    thumbs: Thumbs,
+    /// The sidebar text last drawn, so unchanged text is not sent again.
+    side_drawn: Vec<u8>,
     screen: term::Size,
     cell: (u32, u32),
     cell_queried: bool,
@@ -343,7 +373,11 @@ struct App {
     zoom: f32,
     invert: bool,
     layout: Layout,
+    /// Changes when the pages are cut into images differently.
     gen: u32,
+    /// Changes when what the pages look like changes (inversion, reload):
+    /// thumbnails from before are stale too.
+    content_gen: u32,
     top: u32,
     left: u32,
     strips: HashMap<StripKey, St>,
@@ -400,9 +434,10 @@ impl App {
         transport: Transport,
         budget: usize,
         path: PathBuf,
-        sizes: Vec<(f32, f32)>,
+        info: DocInfo,
         cell: Option<(u32, u32)>,
     ) -> App {
+        let DocInfo { sizes, outline } = info;
         let screen = tty.size();
         let cell_queried = cell.is_some();
         let cell = cell.unwrap_or_else(|| cell_from(screen).unwrap_or((10, 20)));
@@ -437,6 +472,10 @@ impl App {
                 1.0,
             ),
             sizes,
+            outline,
+            side: None,
+            thumbs: Thumbs::default(),
+            side_drawn: Vec::new(),
             screen,
             cell,
             cell_queried,
@@ -445,6 +484,7 @@ impl App {
             zoom: 1.0,
             invert: false,
             gen: 0,
+            content_gen: 0,
             top: 0,
             left: 0,
             strips: HashMap::new(),
@@ -475,7 +515,7 @@ impl App {
             error: None,
             key_at: None,
         };
-        app.relayout();
+        app.relayout(true);
         app.clear = false;
         app
     }
@@ -484,9 +524,17 @@ impl App {
         self.writer.as_ref().expect("writer runs until finish()")
     }
 
+    /// Columns the sidebar takes (0 when closed); the pages get the rest.
+    fn side_cols(&self) -> u32 {
+        match self.side {
+            Some(_) => sidebar::width(self.screen.cols, self.cell.0).unwrap_or(0),
+            None => 0,
+        }
+    }
+
     fn geom(&self) -> Geom {
         Geom {
-            cols: self.screen.cols.max(1),
+            cols: self.screen.cols.saturating_sub(self.side_cols()).max(1),
             rows: self.screen.rows.saturating_sub(1).max(1),
             cw: self.cell.0.max(1),
             ch: self.cell.1.max(1),
@@ -554,7 +602,7 @@ impl App {
                 self.cell_queried = true;
                 if (w, h) != self.cell {
                     self.cell = (w, h);
-                    self.relayout();
+                    self.relayout(false);
                 }
             }
             Input::Graphics(id, Some(err)) => self.refused(id, &err),
@@ -621,12 +669,16 @@ impl App {
                     }
                 }
             }
-            Event::Doc(Ok(sizes)) if !sizes.is_empty() => {
-                self.sizes = sizes;
+            Event::Doc(Ok(info)) if !info.sizes.is_empty() => {
+                self.sizes = info.sizes;
+                self.outline = info.outline;
                 self.page_ver = vec![0; self.sizes.len()];
                 self.search.hits.clear();
                 self.search.cur = None;
-                self.relayout();
+                if let Some(f) = self.side.as_mut().and_then(|s| s.focus.as_mut()) {
+                    f.sel = 0;
+                }
+                self.relayout(true);
                 self.say("reloaded");
             }
             Event::Doc(Ok(_)) => self.say("reload: the PDF has no pages"),
@@ -670,7 +722,10 @@ impl App {
         }
         // The font may have changed size too; ask again.
         self.writer().frame(b"\x1b[16t".to_vec());
-        self.relayout();
+        if sidebar::width(self.screen.cols, self.cell.0).is_none() {
+            self.side = None;
+        }
+        self.relayout(false);
     }
 
     fn say(&mut self, m: &str) {
@@ -737,8 +792,12 @@ impl App {
     }
 
     fn push_jump(&mut self) {
+        self.push_jump_at(self.pos());
+    }
+
+    fn push_jump_at(&mut self, pos: Pos) {
         self.jumps.truncate(self.jump_at);
-        self.jumps.push(self.pos());
+        self.jumps.push(pos);
         if self.jumps.len() > 100 {
             self.jumps.remove(0);
         }
@@ -750,32 +809,41 @@ impl App {
         if fit != self.fit || (zoom - self.zoom).abs() > 1e-3 {
             self.fit = fit;
             self.zoom = zoom;
-            self.relayout();
+            self.relayout(false);
         }
     }
 
-    /// Something changed every page (size, zoom, colors): lay out again and
-    /// forget every image, keeping the reading position.
-    fn relayout(&mut self) {
+    /// The view changed size or shape, or (`content_changed`) the pages look
+    /// different: lay out again, keeping the reading position, and forget the
+    /// images that no longer fit. Pages cut into the same pieces as before
+    /// keep theirs (a narrower view in fit-page mode, say), and so do
+    /// thumbnails of the same size, unless the content changed.
+    fn relayout(&mut self, content_changed: bool) {
         let pos = self.pos();
-        self.gen = self.gen.wrapping_add(1);
+        if content_changed {
+            self.content_gen = self.content_gen.wrapping_add(1);
+        }
         // Full resolution, unless one screen of images (with the pieces that
-        // stick out past its edges) would not fit in the terminal's image
-        // memory with room to spare: then render less sharply, rather than
-        // have the terminal evict images that are on screen.
-        let limit = self.budget / 8 * 7;
+        // stick out past its edges, and the sidebar) would not fit in the
+        // terminal's image memory with room to spare: then render less
+        // sharply, rather than have the terminal evict images that are on screen.
+        let bpp = self.transport.bpp();
+        let side_bytes = (self.side_cols() * self.cell.0) as usize * (self.geom().rows * self.cell.1) as usize * bpp;
+        let limit = (self.budget / 8 * 7).saturating_sub(side_bytes);
         self.scale = 1.0;
-        self.layout = Layout::new(&self.sizes, self.geom(), self.fit, self.zoom);
+        let mut layout = Layout::new(&self.sizes, self.geom(), self.fit, self.zoom);
         for _ in 0..4 {
-            let worst = self.layout.worst_screen_bytes(self.transport.bpp());
+            let worst = layout.worst_screen_bytes(bpp);
             if worst <= limit {
                 break;
             }
             self.scale = (self.scale * (limit as f32 / worst as f32).sqrt() * 0.98).max(0.2);
-            self.layout = Layout::new(&self.sizes, self.geom(), self.fit, self.zoom);
+            layout = Layout::new(&self.sizes, self.geom(), self.fit, self.zoom);
         }
+        let keep = !content_changed && self.layout.same_pieces(&layout);
+        self.layout = layout;
         debug_log!(
-            "layout {}x{} cells of {}x{} px, scale {:.2}, {:?} {:.0}%, screen needs up to {} MB",
+            "layout {}x{} cells of {}x{} px, scale {:.2}, {:?} {:.0}%, screen needs up to {} MB{}",
             self.geom().cols,
             self.geom().rows,
             self.cell.0,
@@ -783,8 +851,13 @@ impl App {
             self.scale,
             self.fit,
             self.zoom * 100.0,
-            self.layout.worst_screen_bytes(self.transport.bpp()) >> 20
+            self.layout.worst_screen_bytes(bpp) >> 20,
+            if keep { ", images kept" } else { "" }
         );
+        self.thumbs = match sidebar::width(self.screen.cols, self.cell.0) {
+            Some(w) => Thumbs::new(&self.sizes, w, self.geom().rows, self.cell.0, self.cell.1),
+            None => Thumbs::default(),
+        };
         self.set_pos(pos);
         let max_left = self
             .layout
@@ -795,21 +868,39 @@ impl App {
             .unwrap_or(0)
             .saturating_sub(self.geom().cols);
         self.left = self.left.min(max_left);
-        for st in self.strips.values() {
-            if let St::Shown { id, .. } = st {
-                self.to_free.push(*id);
+        if !keep {
+            self.gen = self.gen.wrapping_add(1);
+        }
+        let stale: Vec<StripKey> = self
+            .strips
+            .keys()
+            .filter(|k| match k.thumb {
+                true => (k.page as usize) >= self.sizes.len() || **k != self.thumb_key(k.page as usize),
+                false => k.gen != self.gen,
+            })
+            .copied()
+            .collect();
+        for k in stale {
+            match self.strips.remove(&k) {
+                Some(St::Shown { id, mem, .. }) => {
+                    self.to_free.push(id);
+                    self.term_mem -= mem;
+                }
+                Some(St::Queued(mem)) => self.term_mem -= mem,
+                _ => {}
             }
         }
-        self.strips.clear();
-        self.by_id.clear();
+        let strips = &self.strips;
+        self.by_id.retain(|_, k| strips.contains_key(k));
+        if let Some(w) = &self.writer {
+            let by_id = &self.by_id;
+            w.prune(|id| by_id.contains_key(&id));
+        }
         self.placed.clear();
+        self.side_drawn.clear();
         self.wanted.clear();
         self.on_screen.clear();
         self.failures.clear();
-        self.term_mem = 0;
-        if let Some(w) = &self.writer {
-            w.prune(|_| false);
-        }
         self.clear = true;
         self.dirty = true;
     }
@@ -833,6 +924,9 @@ impl App {
             }
         }
         let n = self.count.take();
+        if self.side.as_ref().is_some_and(|s| s.focus.is_some()) {
+            return self.side_key(k, n);
+        }
         let n1 = n.unwrap_or(1) as i64;
         let rows = self.geom().rows as i64;
         let line = (rows / 12).max(2);
@@ -870,8 +964,10 @@ impl App {
             Key::Char('-') => self.set_view(self.fit, self.zoom / 1.25f32.powi(n1 as i32)),
             Key::Char('i') => {
                 self.invert = !self.invert;
-                self.relayout();
+                self.relayout(true);
             }
+            Key::Char('o') => self.side_open(Kind::Outline),
+            Key::Char('t') => self.side_open(Kind::Thumbs),
             Key::Char('r') => {
                 self.worker.push(Job::Reload);
                 self.say("reloading…");
@@ -901,6 +997,7 @@ impl App {
             }
             Key::Ctrl('l') => {
                 self.placed.clear();
+                self.side_drawn.clear();
                 self.clear = true;
                 self.dirty = true;
             }
@@ -1090,6 +1187,209 @@ impl App {
         out.extend_from_slice(b"\x1b[0m");
     }
 
+    // --- the sidebar ---------------------------------------------------------------
+
+    /// `o` or `t`: open that sidebar with the keys, or give it the keys if it
+    /// is open, or hide it if it has them already.
+    fn side_open(&mut self, kind: Kind) {
+        if kind == Kind::Outline && self.outline.is_empty() {
+            return self.say("this PDF has no outline");
+        }
+        match &self.side {
+            Some(s) if s.kind == kind && s.focus.is_some() => return self.side_close(),
+            Some(_) => {}
+            None => {
+                if sidebar::width(self.screen.cols, self.cell.0).is_none() {
+                    return self.say("the window is too narrow for the sidebar");
+                }
+                self.side = Some(Side {
+                    kind,
+                    first: 0,
+                    focus: None,
+                    chosen: None,
+                });
+                self.relayout(false);
+            }
+        }
+        let sel = match kind {
+            Kind::Thumbs => self.layout.page_at(self.top),
+            Kind::Outline => self.current_entry().unwrap_or(0),
+        };
+        // Switching from the other list keeps the place to go back to.
+        let (origin, origin_left) = match self.side.as_ref().and_then(|s| s.focus.as_ref()) {
+            Some(f) => (f.origin, f.origin_left),
+            None => (self.pos(), self.left),
+        };
+        if let Some(side) = self.side.as_mut() {
+            if side.kind != kind {
+                side.first = 0;
+            }
+            side.kind = kind;
+            side.focus = Some(Focus {
+                sel,
+                origin,
+                origin_left,
+            });
+        }
+        self.dirty = true;
+    }
+
+    fn side_close(&mut self) {
+        self.side_leave(true);
+        self.side = None;
+        self.relayout(false);
+    }
+
+    /// The sidebar gives the keys back: at the selected place (`go`), or
+    /// back where the view was before.
+    fn side_leave(&mut self, go: bool) {
+        let Some(side) = self.side.as_mut() else { return };
+        let Some(f) = side.focus.take() else { return };
+        if go && side.kind == Kind::Outline {
+            side.chosen = Some((f.sel, self.top));
+        }
+        if go {
+            let here = self.pos();
+            if here.page != f.origin.page || (here.frac - f.origin.frac).abs() > 1e-3 {
+                self.push_jump_at(f.origin);
+            }
+        } else {
+            self.set_pos(f.origin);
+            self.left = f.origin_left;
+        }
+        self.dirty = true;
+    }
+
+    fn side_key(&mut self, k: Key, n: Option<u32>) {
+        let Some(side) = &self.side else { return };
+        let sel = side.focus.as_ref().map_or(0, |f| f.sel);
+        let rows = self.geom().rows;
+        let (len, screenful) = match side.kind {
+            Kind::Outline => (self.outline.len(), rows.saturating_sub(1) as usize),
+            Kind::Thumbs => (self.sizes.len(), self.thumbs.visible(side.first, rows).len()),
+        };
+        let (n1, half, full) = (n.unwrap_or(1) as usize, (screenful / 2).max(1), screenful.max(1));
+        let to = match k {
+            Key::Char('j') | Key::Down | Key::Ctrl('e' | 'n') => Some(sel + n1),
+            Key::Char('k') | Key::Up | Key::Ctrl('y' | 'p') => Some(sel.saturating_sub(n1)),
+            Key::Ctrl('d') => Some(sel + n1 * half),
+            Key::Ctrl('u') => Some(sel.saturating_sub(n1 * half)),
+            Key::Ctrl('f') | Key::PageDown | Key::Char(' ') => Some(sel + n1 * full),
+            Key::Ctrl('b') | Key::PageUp | Key::Backspace => Some(sel.saturating_sub(n1 * full)),
+            Key::Char('g') | Key::Home => Some(0),
+            Key::Char('G') | Key::End => Some(n.map_or(usize::MAX, |n| (n as usize).saturating_sub(1))),
+            _ => None,
+        };
+        if let Some(to) = to {
+            return self.side_select(to.min(len.saturating_sub(1)));
+        }
+        match k {
+            Key::Enter | Key::Char('l') | Key::Right => self.side_leave(true),
+            Key::Esc | Key::Char('h') | Key::Left => self.side_leave(false),
+            Key::Char('q') => self.side_close(),
+            Key::Char('o') => self.side_open(Kind::Outline),
+            Key::Char('t') => self.side_open(Kind::Thumbs),
+            Key::Char('?') => self.open_help(),
+            Key::Ctrl('c') => self.quit = true,
+            _ => {
+                // Any other key is for the pages.
+                self.side_leave(true);
+                self.count = n;
+                self.key(k);
+            }
+        }
+    }
+
+    /// Selects item `sel` of the sidebar and shows it, as Preview does.
+    fn side_select(&mut self, sel: usize) {
+        let Some(side) = self.side.as_mut() else { return };
+        let kind = side.kind;
+        if let Some(f) = side.focus.as_mut() {
+            f.sel = sel;
+        }
+        match kind {
+            Kind::Thumbs => {
+                if let Some(b) = self.layout.pages.get(sel) {
+                    self.top = b.y;
+                }
+            }
+            Kind::Outline => {
+                if let Some(&pdfium::Entry {
+                    page: Some(p), frac, ..
+                }) = self.outline.get(sel)
+                {
+                    if p < self.layout.pages.len() {
+                        self.top = self.layout.row_in(p, frac).saturating_sub(1);
+                    }
+                }
+            }
+        }
+        self.clamp();
+    }
+
+    /// The outline entry of the place being read: the one last gone to, if
+    /// the view has not moved since, else the last one in the top quarter of
+    /// the screen or above it.
+    fn current_entry(&self) -> Option<usize> {
+        if let Some((i, top)) = self.side.as_ref().and_then(|s| s.chosen) {
+            if top == self.top && i < self.outline.len() {
+                return Some(i);
+            }
+        }
+        let row = self.top + self.layout.geom.rows / 4;
+        let p = self.layout.page_at(row);
+        let b = self.layout.pages[p];
+        let frac = row.saturating_sub(b.y) as f32 / b.rows.max(1) as f32;
+        sidebar::current_entry(&self.outline, p, frac)
+    }
+
+    /// The sidebar's highlighted item: the selection while it has the keys,
+    /// else the page or section being read.
+    fn side_sel(&self) -> Option<usize> {
+        let side = self.side.as_ref()?;
+        if let Some(f) = &side.focus {
+            return Some(f.sel);
+        }
+        match side.kind {
+            Kind::Thumbs => Some(self.layout.page_at(self.top)),
+            Kind::Outline => self.current_entry(),
+        }
+    }
+
+    /// Scrolls the sidebar to its highlighted item; returns the thumbnails
+    /// now on screen.
+    fn side_sync(&mut self) -> Vec<ThumbAt> {
+        let rows = self.geom().rows;
+        let sel = self.side_sel();
+        let Some(side) = self.side.as_mut() else {
+            return Vec::new();
+        };
+        match side.kind {
+            Kind::Outline => {
+                side.first = sidebar::outline_scroll(side.first, sel.unwrap_or(0), self.outline.len(), rows);
+                Vec::new()
+            }
+            Kind::Thumbs => {
+                if let Some(sel) = sel {
+                    side.first = self.thumbs.scroll(side.first, sel, rows);
+                }
+                self.thumbs.visible(side.first, rows)
+            }
+        }
+    }
+
+    fn thumb_key(&self, page: usize) -> StripKey {
+        let g = &self.layout.geom;
+        StripKey {
+            gen: self.content_gen,
+            page: page as u32,
+            ver: 0,
+            k: g.px_x(self.thumbs.size.get(page).map_or(1, |s| s.0)),
+            t: g.px_y(self.thumbs.size.get(page).map_or(1, |s| s.1)),
+            thumb: true,
+        }
+    }
+
     // --- search ------------------------------------------------------------------------
 
     fn search_start(&mut self, needle: String, backward: bool) {
@@ -1210,68 +1510,105 @@ impl App {
             ver: self.page_ver[page],
             k,
             t,
+            thumb: false,
         }
     }
 
-    /// What should be in the terminal, most wanted first: what is on screen,
-    /// then the rest of the pages on screen (nearest strips first), the next
-    /// two pages and the previous one, so a scroll or a page turn usually
-    /// finds its images already there. It stops where the terminal's image
+    /// What should be in the terminal, most wanted first: what is on screen
+    /// (pages and thumbnails), then the rest of the pages on screen (nearest
+    /// strips first), the next two pages and the previous one, so a scroll or
+    /// a page turn usually finds its images already there, then the
+    /// thumbnails just off the sidebar. It stops where the terminal's image
     /// memory would run out; past that, prefetching would only evict.
-    fn wanted_keys(&self, vis: &[Visible]) -> Vec<StripKey> {
+    fn wanted_keys(&self, vis: &[Visible], shown: &[ThumbAt]) -> Vec<StripKey> {
         let bpp = self.transport.bpp();
+        let size = |k: &StripKey| match k.thumb {
+            true => k.k as usize * k.t as usize * bpp,
+            false => self.layout.piece_bytes(k.page as usize, k.k, k.t, bpp),
+        };
         let mut out = Vec::new();
         let mut have = HashSet::new();
         let mut bytes = 0;
-        for v in vis {
-            let key = self.key_of(v.page, v.k, v.t);
+        let on_screen = vis
+            .iter()
+            .map(|v| self.key_of(v.page, v.k, v.t))
+            .chain(shown.iter().map(|t| self.thumb_key(t.page)));
+        for key in on_screen {
             if have.insert(key) {
-                bytes += self.layout.piece_bytes(v.page, v.k, v.t, bpp);
+                bytes += size(&key);
                 out.push(key);
             }
         }
-        let (Some(first), Some(last)) = (vis.first(), vis.last()) else {
-            return out;
-        };
-        let (top, bottom) = (self.top, self.top + self.layout.geom.rows);
-        let mut near: Vec<(u32, usize, u32)> = Vec::new();
-        for p in first.page..=last.page {
-            let b = self.layout.pages[p];
-            for k in 0..self.layout.strips(p) {
-                let y0 = b.y + k * b.strip_rows;
-                let y1 = y0 + self.layout.strip_height(p, k);
-                // Below the screen counts a little nearer than above it.
-                let d = if y0 >= bottom {
-                    (y0 - bottom) * 2
-                } else {
-                    top.saturating_sub(y1) * 3
-                };
-                near.push((d, p, k));
+        let mut more = Vec::new();
+        if let (Some(first), Some(last)) = (vis.first(), vis.last()) {
+            let (top, bottom) = (self.top, self.top + self.layout.geom.rows);
+            let mut near: Vec<(u32, usize, u32)> = Vec::new();
+            for p in first.page..=last.page {
+                let b = self.layout.pages[p];
+                for k in 0..self.layout.strips(p) {
+                    let y0 = b.y + k * b.strip_rows;
+                    let y1 = y0 + self.layout.strip_height(p, k);
+                    // Below the screen counts a little nearer than above it.
+                    let d = if y0 >= bottom {
+                        (y0 - bottom) * 2
+                    } else {
+                        top.saturating_sub(y1) * 3
+                    };
+                    near.push((d, p, k));
+                }
+            }
+            near.sort_unstable();
+            let n = self.layout.pages.len();
+            let pages = (last.page + 1..n).take(2).chain(first.page.checked_sub(1));
+            let rest = pages.flat_map(|p| (0..self.layout.strips(p)).map(move |k| (0, p, k)));
+            for (_, p, k) in near.into_iter().chain(rest) {
+                more.extend(self.layout.tiles_in_view(p, self.left).map(|t| self.key_of(p, k, t)));
             }
         }
-        near.sort_unstable();
-        let n = self.layout.pages.len();
-        let pages = (last.page + 1..n).take(2).chain(first.page.checked_sub(1));
-        let rest = pages.flat_map(|p| (0..self.layout.strips(p)).map(move |k| (0, p, k)));
-        for (_, p, k) in near.into_iter().chain(rest) {
-            for t in self.layout.tiles_in_view(p, self.left) {
-                let key = self.key_of(p, k, t);
-                if have.contains(&key) {
-                    continue;
-                }
-                let size = self.layout.piece_bytes(p, k, t, bpp);
-                if bytes + size > self.budget {
-                    return out;
-                }
-                bytes += size;
-                have.insert(key);
-                out.push(key);
+        if let (Some(a), Some(b)) = (shown.first(), shown.last()) {
+            let pages = (b.page + 1..self.sizes.len()).take(3).chain(a.page.checked_sub(1));
+            more.extend(pages.map(|p| self.thumb_key(p)));
+        }
+        for key in more {
+            if have.contains(&key) {
+                continue;
             }
+            let s = size(&key);
+            if bytes + s > self.budget {
+                break;
+            }
+            bytes += s;
+            have.insert(key);
+            out.push(key);
         }
         out
     }
 
     fn job(&mut self, key: StripKey, id: u32) -> StripJob {
+        if key.thumb {
+            // The page, fit and centered in the thumbnail's cells.
+            let (pw, ph) = self.sizes[key.page as usize];
+            let (bw, bh) = (key.k.max(1), key.t.max(1));
+            let s = (bw as f32 / pw).min(bh as f32 / ph);
+            let (sw, sh) = (
+                ((pw * s).round() as u32).clamp(1, bw),
+                ((ph * s).round() as u32).clamp(1, bh),
+            );
+            return StripJob {
+                key,
+                id,
+                bw,
+                bh,
+                dx: ((bw - sw) / 2) as i32,
+                dy: ((bh - sh) / 2) as i32,
+                size_w: sw,
+                size_h: sh,
+                invert: self.invert,
+                marks: Arc::new(Vec::new()),
+                transport: self.transport,
+                bg: Some(sidebar::BG),
+            };
+        }
         let b = self.layout.pages[key.page as usize];
         let (bw, bh, dx, dy) = self.layout.piece(key.page as usize, key.k, key.t);
         let marks = self
@@ -1292,14 +1629,20 @@ impl App {
             invert: self.invert,
             marks: Arc::new(marks),
             transport: self.transport,
+            bg: None,
         }
     }
 
     fn update(&mut self) {
         let vis = self.layout.visible(self.top, self.left);
-        let want = self.wanted_keys(&vis);
+        let shown = self.side_sync();
+        let want = self.wanted_keys(&vis, &shown);
         if want != self.wanted {
-            self.on_screen = vis.iter().map(|v| self.key_of(v.page, v.k, v.t)).collect();
+            self.on_screen = vis
+                .iter()
+                .map(|v| self.key_of(v.page, v.k, v.t))
+                .chain(shown.iter().map(|t| self.thumb_key(t.page)))
+                .collect();
             let mut jobs = Vec::new();
             for &key in &want {
                 if self.failures.get(&key).is_some_and(|&n| n >= 3) {
@@ -1339,7 +1682,7 @@ impl App {
             self.wanted = want;
         }
         if self.dirty {
-            self.frame(&vis);
+            self.frame(&vis, &shown);
         }
     }
 
@@ -1381,7 +1724,7 @@ impl App {
         self.writer().frame(out);
     }
 
-    fn frame(&mut self, vis: &[Visible]) {
+    fn frame(&mut self, vis: &[Visible], shown: &[ThumbAt]) {
         self.tick += 1;
         let mut out = Vec::with_capacity(4096);
         out.extend_from_slice(b"\x1b[?2026h");
@@ -1391,6 +1734,9 @@ impl App {
         }
         for id in self.to_free.drain(..) {
             encode::free(&mut out, id);
+        }
+        if self.erase.is_some() {
+            self.side_drawn.clear(); // the popup was over it, maybe
         }
         if let Some(r) = self.erase.take() {
             for row in r.r0..r.r1 {
@@ -1404,25 +1750,77 @@ impl App {
                 );
             }
         }
+        if let Some(side) = &self.side {
+            let mut text = Vec::new();
+            sidebar::View {
+                kind: side.kind,
+                cols: self.side_cols(),
+                rows: self.geom().rows,
+                first: side.first,
+                sel: self.side_sel(),
+                focused: side.focus.is_some(),
+                outline: &self.outline,
+                thumbs: &self.thumbs,
+                shown,
+            }
+            .draw(&mut text);
+            if text != self.side_drawn {
+                out.extend_from_slice(&text);
+                self.side_drawn = text;
+            }
+        }
         let popup = self.help.and_then(|s| Some((self.help_rect()?, s)));
         let mut now: HashMap<(u32, u32), [u32; 8]> = HashMap::new();
         let mut missing = false;
-        for v in vis {
+        // Pages right of the sidebar, thumbnails in it; each split around
+        // the popup, if one is open, so its text shows.
+        let x0 = self.side_cols();
+        let pages = vis.iter().map(|v| {
             let key = self.key_of(v.page, v.k, v.t);
-            match self.strips.get_mut(&key) {
-                Some(St::Shown { id, seen, .. }) => {
-                    *seen = self.tick;
-                    let parts = match popup {
-                        Some((hole, _)) => v.around(hole),
-                        None => vec![*v],
-                    };
-                    for (n, v) in parts.iter().enumerate() {
-                        let (sx, sy, sw, sh) = self.layout.source(v);
-                        let at = [v.screen_row, v.screen_col, sx, sy, sw, sh, v.c1 - v.c0, v.b - v.a];
-                        now.insert((*id, n as u32 + 1), at);
-                    }
-                }
-                _ => missing = true,
+            let at = Visible {
+                screen_col: v.screen_col + x0,
+                ..*v
+            };
+            (key, at)
+        });
+        let thumbs = shown.iter().map(|t| {
+            let at = Visible {
+                page: t.page,
+                k: 0,
+                t: 0,
+                a: 0,
+                b: t.shown,
+                c0: 0,
+                c1: self.thumbs.size[t.page].0,
+                screen_row: t.row,
+                screen_col: t.col,
+            };
+            (self.thumb_key(t.page), at)
+        });
+        let pieces: Vec<(StripKey, Visible)> = pages.chain(thumbs).collect();
+        let g = self.layout.geom;
+        for (key, v) in pieces {
+            let Some(St::Shown { id, seen, .. }) = self.strips.get_mut(&key) else {
+                missing = true;
+                continue;
+            };
+            *seen = self.tick;
+            let parts = match popup {
+                Some((hole, _)) => v.around(hole),
+                None => vec![v],
+            };
+            for (n, v) in parts.iter().enumerate() {
+                let (sx, sy, sw, sh) = match key.thumb {
+                    true => (
+                        g.px_x(v.c0),
+                        g.px_y(v.a),
+                        g.px_x(v.c1) - g.px_x(v.c0),
+                        g.px_y(v.b) - g.px_y(v.a),
+                    ),
+                    false => self.layout.source(v),
+                };
+                let at = [v.screen_row, v.screen_col, sx, sy, sw, sh, v.c1 - v.c0, v.b - v.a];
+                now.insert((*id, n as u32 + 1), at);
             }
         }
         for &(id, p) in self.placed.keys() {
@@ -1490,7 +1888,20 @@ impl App {
         if let Some(c) = self.count {
             right = format!("{c}  {right}");
         }
-        let left = self.msg.as_ref().map_or(self.name.as_str(), |(m, _)| m.as_str());
+        let hint = match &self.side {
+            Some(Side {
+                kind, focus: Some(_), ..
+            }) => Some(match kind {
+                Kind::Outline => "contents: j k to move, Enter to go, Esc to go back, o to hide",
+                Kind::Thumbs => "pages: j k to move, Enter to go, Esc to go back, t to hide",
+            }),
+            _ => None,
+        };
+        let left = match (&self.msg, hint) {
+            (Some((m, _)), _) => m.as_str(),
+            (None, Some(h)) => h,
+            (None, None) => self.name.as_str(),
+        };
         let room = cols.saturating_sub(right.chars().count() + 2);
         let left: String = left.chars().take(room).collect();
         let pad = cols.saturating_sub(left.chars().count() + right.chars().count() + 1);

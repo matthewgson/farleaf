@@ -45,6 +45,16 @@ two pages and the previous one. A writer thread owns the terminal: small frames
 needed are dropped before they are sent. The key list popup is drawn as text in
 a hole cut out of the page images, so opening it sends no images.
 
+## The sidebar
+
+The outline comes from the PDF's bookmarks (pdfium resolves each one to a page
+and a height on it), so it is there for any LaTeX paper built with hyperref.
+Thumbnails are images like the strips: rendered by the same worker, counted in
+the same memory budget, prefetched a few pages ahead, and painted on the
+sidebar's background so they blend in. Opening the sidebar narrows the pages;
+in fit-page mode they usually keep their size, and then their images are kept
+and only moved, as they are on any resize that leaves the pieces the same.
+
 ## herdr over SSH
 
 herdr decodes every image it is sent and re-sends it to the outer terminal

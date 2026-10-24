@@ -7,7 +7,7 @@
 //! uploads, and uploads nobody needs any more are dropped before they are sent.
 
 use crate::encode::{self, Payload, Transport};
-use crate::pdfium::{Doc, Page};
+use crate::pdfium::{Doc, Entry, Page};
 use crate::term;
 use std::collections::VecDeque;
 use std::fs::File;
@@ -24,9 +24,12 @@ pub struct StripKey {
     pub gen: u32,
     pub page: u32,
     pub ver: u32,
-    /// Strip (row band) and tile (column band) of the page.
+    /// Strip (row band) and tile (column band) of the page; for a
+    /// thumbnail, its size in cells.
     pub k: u32,
     pub t: u32,
+    /// A thumbnail of the page, for the sidebar.
+    pub thumb: bool,
 }
 
 pub struct StripJob {
@@ -42,6 +45,9 @@ pub struct StripJob {
     pub invert: bool,
     pub marks: Arc<Vec<[f32; 4]>>,
     pub transport: Transport,
+    /// The color around the page, where the bitmap is bigger than it
+    /// (thumbnails); white otherwise.
+    pub bg: Option<[u8; 3]>,
 }
 
 pub enum Job {
@@ -56,8 +62,23 @@ pub enum Job {
     Reload,
 }
 
+/// What the main thread needs of a document: page sizes in points, and the
+/// outline.
+pub struct DocInfo {
+    pub sizes: Vec<(f32, f32)>,
+    pub outline: Vec<Entry>,
+}
+
+impl DocInfo {
+    fn of(doc: &Doc) -> DocInfo {
+        let sizes = doc.page_sizes();
+        let outline = doc.outline(&sizes);
+        DocInfo { sizes, outline }
+    }
+}
+
 pub enum Event {
-    Doc(Result<Vec<(f32, f32)>, String>),
+    Doc(Result<DocInfo, String>),
     Strip(StripKey, u32, Arc<Payload>),
     Found {
         seq: u64,
@@ -118,7 +139,7 @@ fn render_loop(path: PathBuf, q: Arc<(Mutex<Queue>, Condvar)>, tx: Sender<Event>
     };
     let mut doc = match open() {
         Ok(d) => {
-            send(&tx, wake, Event::Doc(Ok(d.page_sizes())));
+            send(&tx, wake, Event::Doc(Ok(DocInfo::of(&d))));
             d
         }
         Err(e) => return send(&tx, wake, Event::Doc(Err(e))),
@@ -146,7 +167,7 @@ fn render_loop(path: PathBuf, q: Arc<(Mutex<Queue>, Condvar)>, tx: Sender<Event>
                 Ok(d) => {
                     pages.clear();
                     doc = d;
-                    send(&tx, wake, Event::Doc(Ok(doc.page_sizes())));
+                    send(&tx, wake, Event::Doc(Ok(DocInfo::of(&doc))));
                 }
                 Err(e) => send(&tx, wake, Event::Doc(Err(e))),
             },
@@ -186,6 +207,9 @@ fn render_loop(path: PathBuf, q: Arc<(Mutex<Queue>, Condvar)>, tx: Sender<Event>
                 if s.invert {
                     rgb.iter_mut().for_each(|v| *v = 255 - *v);
                 }
+                if let Some(bg) = s.bg {
+                    surround(&mut rgb, &s, bg);
+                }
                 let payload = encode::transmit(s.transport, s.id, &rgb, s.bw, s.bh);
                 debug_log!(
                     "strip id={} p{} k{} t{} {}x{}: render {:.1} ms, encode {:.1} ms, {} KB, crc {:08x}",
@@ -221,6 +245,25 @@ fn highlight(rgb: &mut [u8], s: &StripJob) {
                 let i = ((y * w + x) * 3) as usize;
                 rgb[i + 2] = (rgb[i + 2] as u16 * 40 / 255) as u8;
                 rgb[i + 1] = (rgb[i + 1] as u16 * 225 / 255) as u8;
+            }
+        }
+    }
+}
+
+/// Paints `bg` where the bitmap reaches past the page.
+fn surround(rgb: &mut [u8], s: &StripJob, bg: [u8; 3]) {
+    let (w, h) = (s.bw as i64, s.bh as i64);
+    let (x0, y0) = ((s.dx as i64).clamp(0, w), (s.dy as i64).clamp(0, h));
+    let (x1, y1) = (
+        (s.dx as i64 + s.size_w as i64).clamp(0, w),
+        (s.dy as i64 + s.size_h as i64).clamp(0, h),
+    );
+    for (y, row) in rgb.as_chunks_mut::<3>().0.chunks_mut(w as usize).enumerate() {
+        let y = y as i64;
+        for (x, px) in row.iter_mut().enumerate() {
+            let x = x as i64;
+            if y < y0 || y >= y1 || x < x0 || x >= x1 {
+                *px = bg;
             }
         }
     }

@@ -3,7 +3,9 @@
 
   dev/sample_pdf.py OUT.pdf [PAGES]
 
-Every page has the word "farleaf" in it, for the search tests.
+Every page has the word "farleaf" in it, for the search tests. It has an
+outline: a section every four pages with two subsections, some pointing at
+explicit destinations and some through GoTo actions, as LaTeX writes them.
 """
 import sys
 
@@ -30,9 +32,46 @@ def page_stream(n, pages):
     return "\n".join(out).encode()
 
 
+def outline(objs, kids, pages):
+    """Appends outline objects for `pages` pages; returns the root's number."""
+    def dest(page, y):
+        return b"[%d 0 R /XYZ 0 %d null]" % (kids[page], y)
+    root = len(objs) + 1
+    objs.append(None)
+    sections = []
+    for i, page in enumerate(range(0, pages, 4)):
+        sec = len(objs) + 1
+        objs.append(None)
+        subs = []
+        for j, (p, y) in enumerate([(page, 600), (min(page + 2, pages - 1), 400)]):
+            subs.append(len(objs) + 1)
+            # The first subsection by a GoTo action, the second by /Dest.
+            target = b"/A << /S /GoTo /D %s >>" % dest(p, y) if j == 0 else b"/Dest %s" % dest(p, y)
+            objs.append((b"(%d.%d Part %s)" % (i + 1, j + 1, b"ab"[j:j + 1]), sec, target))
+        objs[sec - 1] = (b"(%d Section on page %d)" % (i + 1, page + 1), root, b"/Dest %s" % dest(page, 740), subs)
+        sections.append(sec)
+
+    def link(items):
+        for n, num in enumerate(items):
+            o = objs[num - 1]
+            title, parent, target = o[0], o[1], o[2]
+            d = b"<< /Title %s /Parent %d 0 R %s" % (title, parent, target)
+            if n > 0:
+                d += b" /Prev %d 0 R" % items[n - 1]
+            if n + 1 < len(items):
+                d += b" /Next %d 0 R" % items[n + 1]
+            if len(o) > 3:
+                link(o[3])
+                d += b" /First %d 0 R /Last %d 0 R /Count %d" % (o[3][0], o[3][-1], len(o[3]))
+            objs[num - 1] = d + b" >>"
+    link(sections)
+    objs[root - 1] = b"<< /Type /Outlines /First %d 0 R /Last %d 0 R /Count %d >>" % (
+        sections[0], sections[-1], len(sections))
+    return root
+
+
 def write(path, pages=12):
-    objs = [b"<< /Type /Catalog /Pages 2 0 R >>", None,
-            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
+    objs = [None, None, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
     kids = []
     for n in range(1, pages + 1):
         content = page_stream(n, pages)
@@ -42,6 +81,8 @@ def write(path, pages=12):
         kids.append(len(objs))
     objs[1] = b"<< /Type /Pages /Kids [%s] /Count %d >>" % (
         b" ".join(b"%d 0 R" % k for k in kids), pages)
+    objs[0] = b"<< /Type /Catalog /Pages 2 0 R /Outlines %d 0 R /PageMode /UseOutlines >>" % outline(
+        objs, kids, pages)
     data = bytearray(b"%PDF-1.4\n")
     offsets = []
     for i, o in enumerate(objs, 1):

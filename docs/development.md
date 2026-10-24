@@ -9,7 +9,8 @@ farleaf is a few Rust files and three dependencies (libc, libloading, flate2):
 | `src/worker.rs` | the render worker and the writer thread |
 | `src/encode.rs` | PNG, zlib and shared memory, Kitty commands |
 | `src/term.rs` | raw mode, input and reply parsing, signals |
-| `src/pdfium.rs` | runtime binding to the ~20 pdfium functions used |
+| `src/sidebar.rs` | the outline and thumbnail sidebar |
+| `src/pdfium.rs` | runtime binding to the ~30 pdfium functions used |
 
 ```sh
 scripts/fetch-pdfium.sh
@@ -34,10 +35,17 @@ python3 dev/fake_kitty.py --mbps 9 --keys "2:snap:open 2.5:l 3.5:snap:next 4:q" 
     -- target/release/farleaf paper.pdf
 ```
 
+## The demo GIF
+
+`dev/demo.py` records `docs/demo.gif`: it runs farleaf on `docs/demo/demo.pdf`
+(built from `demo.tex` with pdflatex) in the fake terminal, checks every screen
+against what farleaf drew, and saves one frame per key, with the key in a
+badge. It needs Pillow (`pip install pillow`) to draw the text.
+
 ## Stress test
 
 `dev/stress.py` walks through a reading session (page turns, scrolling, jumps,
-zoom and pan, fit modes, inversion, search, the key list, window resizes,
+zoom and pan, fit modes, inversion, search, the key list, the sidebar, window resizes,
 key-repeat bursts, a reload while the file changes) in windows from 40x12 cells
 to a whole 5K display, in Ghostty locally and over SSH, and in herdr. After every
 step it checks that the screen shows exactly what farleaf drew, image for image

@@ -320,6 +320,18 @@ impl Layout {
         out
     }
 
+    /// Whether `other` cuts every page into the same images as this one, so
+    /// the images already sent stay good (only where they go may differ).
+    pub fn same_pieces(&self, other: &Layout) -> bool {
+        let (a, b) = (&self.geom, &other.geom);
+        (a.cw, a.ch, a.scale) == (b.cw, b.ch, b.scale)
+            && self.pages.len() == other.pages.len()
+            && self.pages.iter().zip(&other.pages).all(|(p, q)| {
+                (p.px_w, p.px_h, p.rows, p.cols, p.strip_rows, p.tile_cols)
+                    == (q.px_w, q.px_h, q.rows, q.cols, q.strip_rows, q.tile_cols)
+            })
+    }
+
     /// The most image memory a screen can take at `bpp` bytes per pixel:
     /// the view, plus the strips and tiles that stick out past its edges.
     pub fn worst_screen_bytes(&self, bpp: usize) -> usize {
@@ -486,6 +498,17 @@ mod tests {
             got.sort();
             assert_eq!(got, want, "{hole:?}");
         }
+    }
+
+    #[test]
+    fn a_narrower_view_keeps_fit_page_pieces_but_not_fit_width_ones() {
+        // Fit page on a wide window: the page is as tall as the view either way.
+        let wide = Layout::new(&[LETTER; 2], geom(300, 55, 19, 42), Fit::Page, 1.0);
+        let less = Layout::new(&[LETTER; 2], geom(270, 55, 19, 42), Fit::Page, 1.0);
+        assert!(wide.same_pieces(&less));
+        let wide = Layout::new(&[LETTER; 2], geom(300, 55, 19, 42), Fit::Width, 1.0);
+        let less = Layout::new(&[LETTER; 2], geom(270, 55, 19, 42), Fit::Width, 1.0);
+        assert!(!wide.same_pieces(&less));
     }
 
     #[test]
