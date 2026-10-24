@@ -1,0 +1,3 @@
+# `cargo dev stress`, `cargo dev term ...`: farleaf's development tools (dev/).
+[alias]
+dev = "run --release -q -p farleaf-dev --"

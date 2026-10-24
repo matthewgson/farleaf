@@ -1,6 +1,6 @@
 [package]
 name = "farleaf"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Fast, minimal terminal PDF reader for Kitty-graphics terminals (Ghostty), herdr and SSH"
 license = "MIT"
@@ -14,6 +14,10 @@ libloading = "0.8"
 # zlib-rs: pure Rust and fast. Its level 1 writes fixed-Huffman blocks that
 # crash Ghostty 1.3.1 on re-placement, so src/encode.rs never uses level 1.
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+
+# dev/: the test and demo tools, with their own dependencies.
+[workspace]
+members = ["dev"]
 
 [profile.release]
 opt-level = 3

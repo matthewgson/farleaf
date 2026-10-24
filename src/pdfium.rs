@@ -304,12 +304,45 @@ pub struct Page {
 
 const BGR: c_int = 2;
 const FPDF_ANNOT: c_int = 0x01;
+const FPDF_REVERSE_BYTE_ORDER: c_int = 0x10;
 
 impl Page {
     /// Renders a `bw`x`bh` window of the page scaled to `size_w`x`size_h` and
     /// shifted by (`dx`, `dy`) pixels: the window's top-left shows page pixel
     /// (-dx, -dy). Returns packed RGB, white where the page doesn't reach.
     pub fn render(&self, bw: u32, bh: u32, dx: i32, dy: i32, size_w: u32, size_h: u32) -> Vec<u8> {
+        let mut out = vec![0u8; bw as usize * bh as usize * 3];
+        self.render_into(&mut out, bw, bh, dx, dy, size_w, size_h);
+        out
+    }
+
+    /// Like `render`, into `out` (packed RGB, `bw`x`bh`): pdfium draws
+    /// straight into it, in RGB order, so nothing is copied or reordered.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_into(&self, out: &mut [u8], bw: u32, bh: u32, dx: i32, dy: i32, size_w: u32, size_h: u32) {
+        assert_eq!(out.len(), bw as usize * bh as usize * 3);
+        unsafe {
+            let bmp = (f().bmp_create)(
+                bw as c_int,
+                bh as c_int,
+                BGR,
+                out.as_mut_ptr().cast(),
+                (bw * 3) as c_int,
+            );
+            if bmp.is_null() {
+                out.fill(255);
+                return;
+            }
+            (f().bmp_fill)(bmp, 0, 0, bw as c_int, bh as c_int, 0xFFFF_FFFF);
+            let flags = FPDF_ANNOT | FPDF_REVERSE_BYTE_ORDER;
+            (f().render)(bmp, self.h, dx, dy, size_w as c_int, size_h as c_int, 0, flags);
+            (f().bmp_destroy)(bmp);
+        }
+    }
+
+    /// The old way, for comparison: render BGR into pdfium's own bitmap, then
+    /// copy it out reordered.
+    pub fn render_swapped(&self, bw: u32, bh: u32, dx: i32, dy: i32, size_w: u32, size_h: u32) -> Vec<u8> {
         let (w, h) = (bw as usize, bh as usize);
         let mut out = vec![0u8; w * h * 3];
         unsafe {

@@ -9,8 +9,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Transport {
     /// The terminal reads our shared memory (it is on this machine): only a
-    /// name crosses the pty. Never under herdr: it accepts the probe but does
-    /// not show images sent this way.
+    /// name crosses the pty, and strips are rendered straight into the shared
+    /// memory. Never under herdr: it accepts the probe but does not show
+    /// images sent this way.
     Shm,
     /// The terminal is elsewhere (SSH): PNG, 8-bit grayscale when the strip
     /// has no color, RGB otherwise. Ghostty decodes PNG with its own robust
@@ -42,9 +43,13 @@ impl Transport {
     }
 }
 
-/// Level 3, never 1: zlib-rs level 1 writes fixed-Huffman blocks, and Ghostty
-/// 1.3.1 crashes when such an `o=z` image is placed a second time.
-const LEVEL: u32 = 3;
+/// zlib levels, never 1: zlib-rs level 1 writes fixed-Huffman blocks, and
+/// Ghostty 1.3.1 crashes when such an `o=z` image is placed a second time.
+/// PNG goes over SSH, where bytes cost more than time; zlib RGB goes to herdr
+/// on the same machine, where level 2 is a fifth faster for 3% more bytes
+/// (measured on papers and scans, 2026-10-24).
+const PNG_LEVEL: u32 = 3;
+const ZLIB_LEVEL: u32 = 2;
 
 /// One strip, encoded and wrapped in its transmit command.
 pub struct Payload {
@@ -56,6 +61,15 @@ pub struct Payload {
 }
 
 impl Payload {
+    fn new(bytes: Vec<u8>, mem: usize, shm: Option<CString>) -> Payload {
+        Payload {
+            bytes,
+            mem,
+            shm,
+            sent: AtomicBool::new(false),
+        }
+    }
+
     /// Once written, the shared memory belongs to the terminal, which
     /// unlinks it after reading.
     pub fn mark_sent(&self) {
@@ -73,40 +87,92 @@ impl Drop for Payload {
     }
 }
 
-/// `rgb` is packed RGB, `w`x`h`. Falls back to PNG if shared memory fails.
+/// `rgb` is packed RGB, `w`x`h`, for the PNG or zlib transport.
 ///
 /// Every command says q=1: no reply on success, but an error comes back, so a
 /// refused or evicted image is noticed and sent again instead of staying blank.
 pub fn transmit(t: Transport, id: u32, rgb: &[u8], w: u32, h: u32) -> Payload {
-    let mem = w as usize * h as usize * t.bpp();
     let mut bytes = Vec::new();
     match t {
-        Transport::Shm => {
-            if let Some(name) = shm_put(rgb) {
-                let ctl = format!("a=t,f=24,t=s,s={w},v={h},S={},i={id},q=1", rgb.len());
-                apc(&mut bytes, &ctl, name.as_bytes());
-                return Payload {
-                    bytes,
-                    mem,
-                    shm: Some(name),
-                    sent: AtomicBool::new(false),
-                };
-            }
-            return transmit(Transport::Png, id, rgb, w, h);
-        }
-        Transport::Png => {
-            let png = png(rgb, w, h);
-            chunked(&mut bytes, &format!("a=t,f=100,i={id},q=1"), &png);
-        }
         Transport::Zlib => {
-            chunked(&mut bytes, &format!("a=t,f=24,o=z,s={w},v={h},i={id},q=1"), &zlib(rgb));
+            let ctl = format!("a=t,f=24,o=z,s={w},v={h},i={id},q=1");
+            chunked(&mut bytes, &ctl, &zlib(rgb, ZLIB_LEVEL));
+        }
+        Transport::Png | Transport::Shm => {
+            chunked(&mut bytes, &format!("a=t,f=100,i={id},q=1"), &png(rgb, w, h));
         }
     }
-    Payload {
-        bytes,
-        mem,
-        shm: None,
-        sent: AtomicBool::new(false),
+    Payload::new(bytes, w as usize * h as usize * t.bpp(), None)
+}
+
+/// A shared memory object being filled with a strip: render into `pixels()`,
+/// then `payload()` hands it to the terminal. Dropped unsent, it is removed.
+pub struct ShmBuf {
+    name: CString,
+    ptr: *mut u8,
+    len: usize,
+}
+
+// The mapping is ours alone until it is handed over.
+unsafe impl Send for ShmBuf {}
+
+impl ShmBuf {
+    /// macOS caps names at 31 bytes, so they stay short.
+    pub fn new(len: usize) -> Option<ShmBuf> {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let name = CString::new(format!("/fl{}-{n}", std::process::id())).ok()?;
+        unsafe {
+            let fd = libc::shm_open(
+                name.as_ptr(),
+                libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+                0o600 as libc::c_uint,
+            );
+            if fd < 0 {
+                return None;
+            }
+            let p = if libc::ftruncate(fd, len as libc::off_t) == 0 {
+                let flags = libc::PROT_READ | libc::PROT_WRITE;
+                libc::mmap(std::ptr::null_mut(), len.max(1), flags, libc::MAP_SHARED, fd, 0)
+            } else {
+                libc::MAP_FAILED
+            };
+            libc::close(fd);
+            if p == libc::MAP_FAILED {
+                libc::shm_unlink(name.as_ptr());
+                return None;
+            }
+            Some(ShmBuf {
+                name,
+                ptr: p.cast(),
+                len,
+            })
+        }
+    }
+
+    pub fn pixels(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+
+    /// The command that has the terminal read it as a `w`x`h` RGB image.
+    pub fn payload(self, id: u32, w: u32, h: u32) -> Payload {
+        let mut bytes = Vec::new();
+        let ctl = format!("a=t,f=24,t=s,s={w},v={h},S={},i={id},q=1", self.len);
+        apc(&mut bytes, &ctl, self.name.as_bytes());
+        unsafe { libc::munmap(self.ptr.cast(), self.len.max(1)) };
+        let me = std::mem::ManuallyDrop::new(self);
+        // The name moves into the payload, which unlinks it if never sent.
+        let name = unsafe { std::ptr::read(&me.name) };
+        Payload::new(bytes, w as usize * h as usize * 3, Some(name))
+    }
+}
+
+impl Drop for ShmBuf {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.ptr.cast(), self.len.max(1));
+            libc::shm_unlink(self.name.as_ptr());
+        }
     }
 }
 
@@ -162,7 +228,7 @@ fn chunked(out: &mut Vec<u8>, ctl: &str, data: &[u8]) {
     }
 }
 
-fn base64(out: &mut Vec<u8>, data: &[u8]) {
+pub fn base64(out: &mut Vec<u8>, data: &[u8]) {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let (chunks, rest) = data.as_chunks::<3>();
     for &[a, b, c] in chunks {
@@ -192,8 +258,8 @@ fn base64(out: &mut Vec<u8>, data: &[u8]) {
     }
 }
 
-fn zlib(data: &[u8]) -> Vec<u8> {
-    let mut z = ZlibEncoder::new(Vec::with_capacity(data.len() / 16), Compression::new(LEVEL));
+pub fn zlib(data: &[u8], level: u32) -> Vec<u8> {
+    let mut z = ZlibEncoder::new(Vec::with_capacity(data.len() / 16), Compression::new(level));
     z.write_all(data).expect("writing to a Vec cannot fail");
     z.finish().expect("writing to a Vec cannot fail")
 }
@@ -205,25 +271,32 @@ fn zlib(data: &[u8]) -> Vec<u8> {
 /// almost never pure gray (antialiasing leaves a few tinted pixels), but half
 /// to three quarters of strips are, and those come out about 3x smaller.
 pub fn png(rgb: &[u8], w: u32, h: u32) -> Vec<u8> {
-    let gray = rgb.as_chunks::<3>().0.iter().all(|&[r, g, b]| r == g && g == b);
-    let row = w as usize * if gray { 1 } else { 3 };
-    let mut raw = Vec::with_capacity((row + 1) * h as usize);
-    for src in rgb.chunks_exact(w as usize * 3) {
+    let (w, h) = (w as usize, h as usize);
+    // One pass both checks for gray and gathers it; a colored pixel stops it.
+    let mut raw = Vec::with_capacity((w + 1) * h);
+    let gray = rgb.chunks_exact(w * 3).all(|row| {
         raw.push(0);
-        if gray {
-            raw.extend(src.iter().step_by(3));
-        } else {
-            raw.extend_from_slice(src);
+        row.as_chunks::<3>().0.iter().all(|&[r, g, b]| {
+            raw.push(r);
+            r == g && g == b
+        })
+    });
+    if !gray {
+        raw.clear();
+        raw.reserve((w * 3 + 1) * h);
+        for row in rgb.chunks_exact(w * 3) {
+            raw.push(0);
+            raw.extend_from_slice(row);
         }
     }
     let mut out = Vec::with_capacity(raw.len() / 8);
     out.extend_from_slice(b"\x89PNG\r\n\x1a\n");
     let mut ihdr = Vec::with_capacity(13);
-    ihdr.extend_from_slice(&w.to_be_bytes());
-    ihdr.extend_from_slice(&h.to_be_bytes());
+    ihdr.extend_from_slice(&(w as u32).to_be_bytes());
+    ihdr.extend_from_slice(&(h as u32).to_be_bytes());
     ihdr.extend_from_slice(&[8, if gray { 0 } else { 2 }, 0, 0, 0]);
     png_chunk(&mut out, b"IHDR", &ihdr);
-    png_chunk(&mut out, b"IDAT", &zlib(&raw));
+    png_chunk(&mut out, b"IDAT", &zlib(&raw, PNG_LEVEL));
     png_chunk(&mut out, b"IEND", &[]);
     out
 }
@@ -232,75 +305,20 @@ fn png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
     out.extend_from_slice(&(data.len() as u32).to_be_bytes());
     out.extend_from_slice(kind);
     out.extend_from_slice(data);
-    let crc = crc32(crc32(0xFFFF_FFFF, kind), data) ^ 0xFFFF_FFFF;
-    out.extend_from_slice(&crc.to_be_bytes());
-}
-
-fn crc32(mut crc: u32, data: &[u8]) -> u32 {
-    static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
-    let t = TABLE.get_or_init(|| {
-        let mut t = [0u32; 256];
-        for (i, e) in t.iter_mut().enumerate() {
-            let mut c = i as u32;
-            for _ in 0..8 {
-                c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
-            }
-            *e = c;
-        }
-        t
-    });
-    for &b in data {
-        crc = t[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
-    }
-    crc
-}
-
-/// Writes `data` to a new POSIX shared memory object and returns its name.
-/// macOS caps names at 31 bytes, so they stay short.
-fn shm_put(data: &[u8]) -> Option<CString> {
-    static N: AtomicU32 = AtomicU32::new(0);
-    let name = CString::new(format!(
-        "/fl{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ))
-    .ok()?;
-    unsafe {
-        let fd = libc::shm_open(
-            name.as_ptr(),
-            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
-            0o600 as libc::c_uint,
-        );
-        if fd < 0 {
-            return None;
-        }
-        let ok = libc::ftruncate(fd, data.len() as libc::off_t) == 0 && {
-            let p = libc::mmap(
-                std::ptr::null_mut(),
-                data.len(),
-                libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            );
-            p != libc::MAP_FAILED && {
-                std::ptr::copy_nonoverlapping(data.as_ptr(), p.cast::<u8>(), data.len());
-                libc::munmap(p, data.len());
-                true
-            }
-        };
-        libc::close(fd);
-        if !ok {
-            libc::shm_unlink(name.as_ptr());
-            return None;
-        }
-    }
-    Some(name)
+    // flate2's CRC uses the CPU's CRC instructions where there are any.
+    let mut crc = flate2::Crc::new();
+    crc.update(kind);
+    crc.update(data);
+    out.extend_from_slice(&crc.sum().to_be_bytes());
 }
 
 /// The 1x1 shared-memory object for the startup probe.
 pub fn shm_probe() -> Option<(CString, Vec<u8>)> {
-    let name = shm_put(&[0, 0, 0])?;
+    let mut buf = ShmBuf::new(3)?;
+    buf.pixels().fill(0);
+    let me = std::mem::ManuallyDrop::new(buf);
+    unsafe { libc::munmap(me.ptr.cast(), me.len) };
+    let name = unsafe { std::ptr::read(&me.name) };
     let mut cmd = Vec::new();
     apc(&mut cmd, "i=2,a=q,t=s,f=24,s=1,v=1,S=3", name.as_bytes());
     Some((name, cmd))
@@ -326,8 +344,18 @@ mod tests {
     }
 
     #[test]
-    fn crc_of_iend_is_standard() {
-        assert_eq!(crc32(0xFFFF_FFFF, b"IEND") ^ 0xFFFF_FFFF, 0xAE42_6082);
+    fn png_chunks_have_standard_crcs() {
+        let mut out = Vec::new();
+        png_chunk(&mut out, b"IEND", &[]);
+        assert_eq!(out[8..], 0xAE42_6082u32.to_be_bytes());
+    }
+
+    #[test]
+    fn png_is_gray_only_when_every_pixel_is() {
+        let gray = [7u8, 7, 7, 9, 9, 9];
+        let color = [7u8, 7, 7, 9, 9, 8];
+        assert_eq!(png(&gray, 2, 1)[25], 0);
+        assert_eq!(png(&color, 2, 1)[25], 2);
     }
 
     #[test]
@@ -338,5 +366,24 @@ mod tests {
         assert!(s.starts_with("\x1b_Ga=t,m=1;"));
         assert!(s.contains("\x1b\\\x1b_Gm=0;"));
         assert_eq!(s.matches("\x1b_G").count(), 2);
+    }
+
+    #[test]
+    fn shared_memory_holds_what_was_written() {
+        let mut buf = ShmBuf::new(6).expect("shared memory");
+        buf.pixels().copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        let name = buf.name.clone();
+        let p = buf.payload(9, 2, 1);
+        assert!(String::from_utf8_lossy(&p.bytes).contains("t=s,s=2,v=1,S=6,i=9"));
+        unsafe {
+            let fd = libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0);
+            assert!(fd >= 0);
+            let m = libc::mmap(std::ptr::null_mut(), 6, libc::PROT_READ, libc::MAP_SHARED, fd, 0);
+            assert_eq!(std::slice::from_raw_parts(m as *const u8, 6), &[1, 2, 3, 4, 5, 6]);
+            libc::munmap(m, 6);
+            libc::close(fd);
+        }
+        drop(p); // never sent: unlinked
+        assert!(unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) } < 0);
     }
 }

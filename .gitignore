@@ -1,7 +1,6 @@
 /target
 /vendor
 /dev/out
-__pycache__/
 # Personal notes and scripts, kept out of the public repo.
 /CLAUDE.md
 /local

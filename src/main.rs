@@ -28,6 +28,7 @@ fn debug_crc(rgb: &[u8]) -> u32 {
     c.sum()
 }
 
+mod bench;
 mod encode;
 mod layout;
 mod pdfium;
@@ -46,7 +47,7 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use term::{Input, Key, Parser, Tty};
-use worker::{DocInfo, Event, Job, StripJob, StripKey, Worker, Writer};
+use worker::{Event, Job, StripJob, StripKey, Worker, Writer};
 
 /// Every key, for the help popup (`?`) and --help. A row without keys
 /// starts a section.
@@ -124,7 +125,7 @@ fn main() {
     if !file.is_file() {
         fail(&format!("{}: no such file", file.display()));
     }
-    let result = if bench { bench_mode(&file) } else { run(file, page) };
+    let result = if bench { bench::run(&file) } else { run(file, page) };
     if let Err(e) = result {
         fail(&e);
     }
@@ -243,9 +244,9 @@ fn run(path: PathBuf, start_page: Option<usize>) -> Result<(), String> {
     let budget = if herdr { HERDR_BUDGET } else { GHOSTTY_BUDGET };
 
     // The document has been loading on the worker while we probed.
-    let info = loop {
+    let sizes = loop {
         match rx.recv() {
-            Ok(Event::Doc(Ok(info))) if !info.sizes.is_empty() => break info,
+            Ok(Event::Doc(Ok(sizes))) if !sizes.is_empty() => break sizes,
             Ok(Event::Doc(Ok(_))) => {
                 term::leave();
                 return Err(format!("{}: the PDF has no pages", path.display()));
@@ -264,7 +265,7 @@ fn run(path: PathBuf, start_page: Option<usize>) -> Result<(), String> {
     let out = tty.file.try_clone().map_err(|e| e.to_string())?;
     let writer = Writer::spawn(out, tx, wake_w);
     let mut app = App::new(
-        tty, wake_r, rx, worker, writer, transport, budget, path, info, probe.cell,
+        tty, wake_r, rx, worker, writer, transport, budget, path, sizes, probe.cell,
     );
     if let Some(p) = start_page {
         app.goto_page(p.saturating_sub(1), false);
@@ -359,6 +360,8 @@ struct App {
     name: String,
     sizes: Vec<(f32, f32)>,
     outline: Vec<pdfium::Entry>,
+    /// The outline has been read (it comes after the first screen).
+    outline_ready: bool,
     side: Option<Side>,
     /// Thumbnail sizes for the sidebar (set by relayout).
     thumbs: Thumbs,
@@ -434,10 +437,9 @@ impl App {
         transport: Transport,
         budget: usize,
         path: PathBuf,
-        info: DocInfo,
+        sizes: Vec<(f32, f32)>,
         cell: Option<(u32, u32)>,
     ) -> App {
-        let DocInfo { sizes, outline } = info;
         let screen = tty.size();
         let cell_queried = cell.is_some();
         let cell = cell.unwrap_or_else(|| cell_from(screen).unwrap_or((10, 20)));
@@ -472,7 +474,8 @@ impl App {
                 1.0,
             ),
             sizes,
-            outline,
+            outline: Vec::new(),
+            outline_ready: false,
             side: None,
             thumbs: Thumbs::default(),
             side_drawn: Vec::new(),
@@ -669,9 +672,8 @@ impl App {
                     }
                 }
             }
-            Event::Doc(Ok(info)) if !info.sizes.is_empty() => {
-                self.sizes = info.sizes;
-                self.outline = info.outline;
+            Event::Doc(Ok(sizes)) if !sizes.is_empty() => {
+                self.sizes = sizes;
                 self.page_ver = vec![0; self.sizes.len()];
                 self.search.hits.clear();
                 self.search.cur = None;
@@ -682,6 +684,18 @@ impl App {
                 self.say("reloaded");
             }
             Event::Doc(Ok(_)) => self.say("reload: the PDF has no pages"),
+            Event::Outline(outline) => {
+                debug_log!("outline: {} entries", outline.len());
+                self.outline = outline;
+                self.outline_ready = true;
+                let len = self.outline.len();
+                if let Some(side) = self.side.as_mut().filter(|s| s.kind == Kind::Outline) {
+                    if let Some(f) = side.focus.as_mut() {
+                        f.sel = f.sel.min(len.saturating_sub(1));
+                    }
+                    self.dirty = true;
+                }
+            }
             Event::Doc(Err(e)) => self.say(&format!("reload failed: {e}")),
             Event::Found { seq, hit } => self.found(seq, hit),
             Event::WriteFailed(e) => {
@@ -1192,6 +1206,9 @@ impl App {
     /// `o` or `t`: open that sidebar with the keys, or give it the keys if it
     /// is open, or hide it if it has them already.
     fn side_open(&mut self, kind: Kind) {
+        if kind == Kind::Outline && !self.outline_ready {
+            return self.say("still reading the outline, a moment");
+        }
         if kind == Kind::Outline && self.outline.is_empty() {
             return self.say("this PDF has no outline");
         }
@@ -1665,7 +1682,7 @@ impl App {
             let wanted: HashSet<StripKey> = want.iter().copied().collect();
             let by_id = &mut self.by_id;
             self.strips.retain(|k, st| match st {
-                St::Rendering(id) if !wanted.contains(k) && Some(*k) != busy => {
+                St::Rendering(id) if !wanted.contains(k) && !busy.contains(k) => {
                     by_id.remove(id);
                     false
                 }
@@ -1944,42 +1961,4 @@ fn help_width() -> usize {
 /// Cell size from the window's pixel size, when the terminal reports one.
 fn cell_from(s: term::Size) -> Option<(u32, u32)> {
     (s.px_w > 0 && s.px_h > 0 && s.cols > 0 && s.rows > 0).then(|| (s.px_w / s.cols, s.px_h / s.rows))
-}
-
-/// `farleaf --bench FILE`: render and encode the first pages at a typical
-/// reading width, and report the time and size of each transport.
-fn bench_mode(path: &PathBuf) -> Result<(), String> {
-    pdfium::init()?;
-    let doc = pdfium::Doc::open(std::fs::read(path).map_err(|e| e.to_string())?)?;
-    let sizes = doc.page_sizes();
-    let width: u32 = std::env::var("FARLEAF_BENCH_WIDTH")
-        .ok()
-        .and_then(|w| w.parse().ok())
-        .unwrap_or(2489);
-    println!("{} pages; rendering at {width} px wide", sizes.len());
-    println!("page   render   png(ms)  png(KB)  zlib(ms) zlib(KB)  raw(KB)");
-    for (i, &(pw, ph)) in sizes.iter().enumerate().take(8) {
-        let h = (ph * width as f32 / pw).round() as u32;
-        let t = Instant::now();
-        let page = doc.page(i).ok_or("page failed to load")?;
-        let rgb = page.render(width, h, 0, 0, width, h);
-        let render = t.elapsed();
-        let t = Instant::now();
-        let png = encode::transmit(Transport::Png, 1, &rgb, width, h);
-        let png_t = t.elapsed();
-        let t = Instant::now();
-        let z = encode::transmit(Transport::Zlib, 1, &rgb, width, h);
-        let z_t = t.elapsed();
-        println!(
-            "{:>4} {:>8.1} {:>9.1} {:>8} {:>9.1} {:>8} {:>8}",
-            i + 1,
-            render.as_secs_f64() * 1e3,
-            png_t.as_secs_f64() * 1e3,
-            png.bytes.len() / 1024,
-            z_t.as_secs_f64() * 1e3,
-            z.bytes.len() / 1024,
-            rgb.len() / 1024
-        );
-    }
-    Ok(())
 }

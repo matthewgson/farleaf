@@ -49,10 +49,9 @@ jobs:
           if [ ${{ matrix.platform }} = mac-x64 ] && ! arch -x86_64 /usr/bin/true 2>/dev/null; then
             echo "no Rosetta on this runner; skipped"; exit 0
           fi
-          python3 dev/sample_pdf.py "$RUNNER_TEMP/sample.pdf" 3
           d=dist/farleaf-${{ matrix.platform }}
           "$d/farleaf" --version
-          FARLEAF_BENCH_WIDTH=800 "$d/farleaf" --bench "$RUNNER_TEMP/sample.pdf"
+          FARLEAF_BENCH_PAGES=2 "$d/farleaf" --bench docs/demo/demo.pdf
       - uses: actions/upload-artifact@v7
         with:
           name: farleaf-${{ matrix.platform }}

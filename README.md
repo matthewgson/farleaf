@@ -8,7 +8,7 @@ and inside [herdr](https://herdr.dev).
 
 - Renders with [pdfium](https://pdfium.googlesource.com/pdfium/), Chrome's PDF engine.
 - Turning a page usually only moves images that are already in the terminal; a
-  jump to a new page renders and sends in about 40 ms.
+  jump to a new page is on screen in 20-30 ms locally, about 0.1 s over SSH.
 - Picks the fastest way to send images by asking the terminal at startup:
   shared memory locally, compressed images over SSH.
 - A sidebar with the outline (sections and subsections) or page thumbnails,
