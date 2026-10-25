@@ -2,11 +2,15 @@
 //! its first pages strip by strip, as farleaf would for a window of
 //! FARLEAF_BENCH_GEOM (columns x rows x cell width x cell height; by default
 //! 131x48x19x42, half of a 5K display), and times each stage.
+//!
+//! FARLEAF_BENCH_PAGES sets how many pages, FARLEAF_BENCH_LEVELS=1 compares
+//! zlib levels, and FARLEAF_BENCH_PNG=out.png saves page 2 as rendered.
 
 use crate::encode;
 use crate::layout::{Fit, Geom, Layout};
-use crate::pdfium;
+use crate::mupdf;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn ms(d: Duration) -> f64 {
@@ -22,7 +26,7 @@ fn timed<T>(f: impl FnOnce() -> T) -> (T, Duration) {
 pub fn run(path: &Path) -> Result<(), String> {
     // Piped into `head`, stop quietly when it has read enough.
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
-    pdfium::init()?;
+    mupdf::init()?;
     let geom = std::env::var("FARLEAF_BENCH_GEOM").unwrap_or_else(|_| "131x48x19x42".into());
     let g: Vec<u32> = geom.split('x').filter_map(|n| n.parse().ok()).collect();
     let [cols, rows, cw, ch] = g[..] else {
@@ -32,10 +36,19 @@ pub fn run(path: &Path) -> Result<(), String> {
         .ok()
         .and_then(|n| n.parse().ok())
         .unwrap_or(10);
+    let threads = std::env::var("FARLEAF_BENCH_THREADS")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map_or(4, |n| n.get())
+                .saturating_sub(2)
+                .clamp(1, 8)
+        });
 
     let (bytes, read) = timed(|| std::fs::read(path));
     let bytes = bytes.map_err(|e| e.to_string())?;
-    let (doc, open) = timed(|| pdfium::Doc::open(bytes));
+    let (doc, open) = timed(|| mupdf::Doc::open(bytes));
     let doc = doc?;
     let (sizes, sizes_t) = timed(|| doc.page_sizes());
     let (outline, outline_t) = timed(|| doc.outline(&sizes));
@@ -49,6 +62,14 @@ pub fn run(path: &Path) -> Result<(), String> {
         outline.len(),
         ms(outline_t)
     );
+    if std::env::var_os("FARLEAF_BENCH_OUTLINE").is_some() {
+        for e in &outline {
+            let at = e
+                .page
+                .map_or("-".into(), |p| format!("page {} at {:.3}", p + 1, e.frac));
+            println!("  {}{}  ({at})", "  ".repeat(e.depth as usize), e.title);
+        }
+    }
     let geom = Geom {
         cols,
         rows,
@@ -58,39 +79,58 @@ pub fn run(path: &Path) -> Result<(), String> {
     };
     let layout = Layout::new(&sizes, geom, Fit::Width, 1.0);
     println!(
-        "window {cols}x{rows} cells of {cw}x{ch} px, fit width: pages {} px wide, strips {} rows",
+        "window {cols}x{rows} cells of {cw}x{ch} px, fit width: pages {} px wide, strips {} rows; {threads} render threads",
         layout.pages[0].px_w, layout.pages[0].strip_rows
     );
     println!(
-        "{:>4} {:>6} {:>7} {:>7} {:>7} {:>7} {:>6} {:>7} {:>7} {:>6}",
-        "page", "load", "strips", "render", "whole", "png", "b64", "zlib", "png KB", "gray"
+        "{:>4} {:>6} {:>7} {:>7} {:>8} {:>7} {:>7} {:>6} {:>7} {:>7} {:>6}",
+        "page", "load", "strips", "render", "parallel", "whole", "png", "b64", "zlib", "png KB", "gray"
     );
-    let mut sum = [Duration::ZERO; 6];
+    let mut sum = [Duration::ZERO; 7];
     let (mut png_bytes, mut zlib_bytes, mut raw_bytes, mut n) = (0, 0, 0, 0);
     for p in 0..sizes.len().min(pages) {
         let (page, load) = timed(|| doc.page(p));
-        let page = page.ok_or("page failed to load")?;
+        let page = Arc::new(page.ok_or("page failed to load")?);
+        let b = layout.pages[p];
+        let pieces: Vec<(u32, u32, i32, i32)> = (0..layout.strips(p))
+            .flat_map(|k| (0..layout.tiles(p)).map(move |t| (k, t)))
+            .map(|(k, t)| layout.piece(p, k, t))
+            .collect();
+        // Each way timed cold: nothing decoded or cached from the one before.
+        mupdf::empty_cache();
         let mut strips = Vec::new();
         let mut render = Duration::ZERO;
-        for k in 0..layout.strips(p) {
-            for t in 0..layout.tiles(p) {
-                let (bw, bh, dx, dy) = layout.piece(p, k, t);
-                let b = layout.pages[p];
-                let (rgb, d) = timed(|| page.render(bw, bh, dx, dy, b.px_w, b.px_h));
-                render += d;
-                strips.push((rgb, bw, bh));
-            }
+        for &(bw, bh, dx, dy) in &pieces {
+            let (rgb, d) = timed(|| page.render(bw, bh, dx, dy, b.px_w, b.px_h));
+            render += d;
+            strips.push((rgb, bw, bh));
         }
-        let b = layout.pages[p];
-        let (direct, whole) = timed(|| page.render(b.px_w, b.px_h, 0, 0, b.px_w, b.px_h));
-        if std::env::var_os("FARLEAF_BENCH_CHECK").is_some() {
-            let (old, old_t) = timed(|| page.render_swapped(b.px_w, b.px_h, 0, 0, b.px_w, b.px_h));
-            let differ = direct.iter().zip(&old).filter(|(a, b)| a != b).count();
+        // The same strips on the render threads, as farleaf does them; they
+        // must come out the same.
+        mupdf::empty_cache();
+        let out: Vec<std::sync::Mutex<Vec<u8>>> = pieces.iter().map(|_| Default::default()).collect();
+        let (_, parallel) = timed(|| {
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                for _ in 0..threads {
+                    s.spawn(|| loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(&(bw, bh, dx, dy)) = pieces.get(i) else { break };
+                        *out[i].lock().unwrap() = page.render(bw, bh, dx, dy, b.px_w, b.px_h);
+                    });
+                }
+            })
+        });
+        if out.iter().zip(&strips).any(|(o, s)| *o.lock().unwrap() != s.0) {
             println!(
-                "     direct RGB {:.1} ms, BGR + reorder {:.1} ms, {differ} bytes differ",
-                ms(whole),
-                ms(old_t)
+                "     page {}: strips rendered in parallel differ from serial ones",
+                p + 1
             );
+        }
+        mupdf::empty_cache();
+        let (whole_rgb, whole) = timed(|| page.render(b.px_w, b.px_h, 0, 0, b.px_w, b.px_h));
+        if let Some(out) = std::env::var_os("FARLEAF_BENCH_PNG").filter(|_| p == 1) {
+            std::fs::write(out, encode::png(&whole_rgb, b.px_w, b.px_h)).map_err(|e| e.to_string())?;
         }
         let (mut png, mut b64, mut zlib, mut gray, mut kb) = (Duration::ZERO, Duration::ZERO, Duration::ZERO, 0, 0);
         for (rgb, w, h) in &strips {
@@ -107,15 +147,16 @@ pub fn run(path: &Path) -> Result<(), String> {
         }
         png_bytes += kb;
         n += 1;
-        for (s, d) in sum.iter_mut().zip([load, render, whole, png, b64, zlib]) {
+        for (s, d) in sum.iter_mut().zip([load, render, parallel, whole, png, b64, zlib]) {
             *s += d;
         }
         println!(
-            "{:>4} {:>6.1} {:>7} {:>7.1} {:>7.1} {:>7.1} {:>6.1} {:>7.1} {:>7} {:>3}/{:<2}",
+            "{:>4} {:>6.1} {:>7} {:>7.1} {:>8.1} {:>7.1} {:>7.1} {:>6.1} {:>7.1} {:>7} {:>3}/{:<2}",
             p + 1,
             ms(load),
             strips.len(),
             ms(render),
+            ms(parallel),
             ms(whole),
             ms(png),
             ms(b64),
@@ -123,125 +164,6 @@ pub fn run(path: &Path) -> Result<(), String> {
             kb / 1024,
             gray,
             strips.len()
-        );
-    }
-    if std::env::var_os("FARLEAF_BENCH_BANDS").is_some() {
-        // Several strips rendered in one call, then cut apart.
-        let n = sizes.len().min(pages);
-        for per in [1u32, 2, 4, 8, 16, 1000] {
-            let mut total = Duration::ZERO;
-            for p in 0..n {
-                let page = doc.page(p).ok_or("page failed to load")?;
-                let b = layout.pages[p];
-                let strips = layout.strips(p);
-                let mut k = 0;
-                while k < strips {
-                    let last = (k + per).min(strips) - 1;
-                    let (bw, _, dx, dy) = layout.piece(p, k, 0);
-                    let (_, bh_last, _, dy_last) = layout.piece(p, last, 0);
-                    let bh = (dy - dy_last) as u32 + bh_last;
-                    let (_, d) = timed(|| page.render(bw, bh, dx, dy, b.px_w, b.px_h));
-                    total += d;
-                    k = last + 1;
-                }
-            }
-            println!("{per:>4} strips per call: {:.1} ms per page", ms(total) / n as f64);
-        }
-    }
-    if std::env::var_os("FARLEAF_BENCH_PALETTE").is_some() {
-        let n = sizes.len().min(pages);
-        let (mut color, mut few, mut rgb_kb, mut idx_kb, mut idx_t) = (0, 0, 0, 0, Duration::ZERO);
-        let mut filt_kb = [0usize; 5];
-        for p in 0..n {
-            let page = doc.page(p).ok_or("page failed to load")?;
-            for k in 0..layout.strips(p) {
-                let (bw, bh, dx, dy) = layout.piece(p, k, 0);
-                let b = layout.pages[p];
-                let rgb = page.render(bw, bh, dx, dy, b.px_w, b.px_h);
-                if rgb.as_chunks::<3>().0.iter().all(|&[r, g, b]| r == g && g == b) {
-                    continue;
-                }
-                color += 1;
-                let t = Instant::now();
-                let mut index = std::collections::HashMap::new();
-                let mut data = Vec::with_capacity(rgb.len() / 3);
-                let fits = rgb.as_chunks::<3>().0.iter().all(|px| {
-                    let n = index.len();
-                    let i = *index.entry(*px).or_insert(n);
-                    data.push(i as u8);
-                    index.len() <= 256
-                });
-                idx_t += t.elapsed();
-                // PNG row filters: none, sub, up, paeth, each row choosing.
-                let w3 = bw as usize * 3;
-                for (fi, f) in ["none", "sub", "up", "paeth", "adaptive"].iter().enumerate() {
-                    let mut raw = Vec::with_capacity(rgb.len() + bh as usize);
-                    let mut prev = vec![0u8; w3];
-                    for row in rgb.chunks_exact(w3) {
-                        let filt = |t: usize| -> Vec<u8> {
-                            (0..w3)
-                                .map(|x| {
-                                    let a = if x >= 3 { row[x - 3] } else { 0 };
-                                    let b = prev[x];
-                                    let c = if x >= 3 { prev[x - 3] } else { 0 };
-                                    let pred = match t {
-                                        0 => 0,
-                                        1 => a,
-                                        2 => b,
-                                        _ => {
-                                            let p = a as i16 + b as i16 - c as i16;
-                                            let (pa, pb, pc) =
-                                                ((p - a as i16).abs(), (p - b as i16).abs(), (p - c as i16).abs());
-                                            if pa <= pb && pa <= pc {
-                                                a
-                                            } else if pb <= pc {
-                                                b
-                                            } else {
-                                                c
-                                            }
-                                        }
-                                    };
-                                    row[x].wrapping_sub(pred)
-                                })
-                                .collect()
-                        };
-                        let (t, data) = match fi {
-                            4 => (0..4usize)
-                                .map(|t| (t, filt(t)))
-                                .min_by_key(|(_, d)| d.iter().map(|&v| (v as i8).unsigned_abs() as u32).sum::<u32>())
-                                .unwrap(),
-                            t => (t.min(3), filt(t.min(3))),
-                        };
-                        raw.push([0u8, 1, 2, 4][t]);
-                        raw.extend_from_slice(&data);
-                        prev.copy_from_slice(row);
-                    }
-                    filt_kb[fi] += encode::zlib(&raw, 3).len();
-                    let _ = f;
-                }
-                let z = encode::zlib(&rgb, 3).len();
-                rgb_kb += z;
-                if fits {
-                    few += 1;
-                    idx_kb += encode::zlib(&data, 3).len();
-                } else {
-                    idx_kb += z;
-                }
-            }
-        }
-        println!(
-            "{color} color strips, {few} with <= 256 colors; RGB {} KB, indexed where possible {} KB; indexing {:.1} ms per page",
-            rgb_kb / 1024,
-            idx_kb / 1024,
-            ms(idx_t) / n as f64
-        );
-        println!(
-            "color strips by PNG filter, KB: none {}, sub {}, up {}, paeth {}, adaptive {}",
-            filt_kb[0] / 1024,
-            filt_kb[1] / 1024,
-            filt_kb[2] / 1024,
-            filt_kb[3] / 1024,
-            filt_kb[4] / 1024
         );
     }
     if std::env::var_os("FARLEAF_BENCH_LEVELS").is_some() {
@@ -254,12 +176,11 @@ pub fn run(path: &Path) -> Result<(), String> {
                 let b = layout.pages[p];
                 let rgb = page.render(bw, bh, dx, dy, b.px_w, b.px_h);
                 let gray = rgb.as_chunks::<3>().0.iter().all(|&[r, g, b]| r == g && g == b);
-                let data: Vec<u8> = if gray {
+                all.push(if gray {
                     rgb.iter().step_by(3).copied().collect()
                 } else {
                     rgb
-                };
-                all.push(data);
+                });
             }
         }
         for level in 1..=9 {
@@ -276,7 +197,7 @@ pub fn run(path: &Path) -> Result<(), String> {
     }
     let avg = |d: Duration| ms(d) / n as f64;
     println!(
-        "mean {:>6.1} {:>7} {:>7.1} {:>7.1} {:>7.1} {:>6.1} {:>7.1} {:>7}",
+        "mean {:>6.1} {:>7} {:>7.1} {:>8.1} {:>7.1} {:>7.1} {:>6.1} {:>7.1} {:>7}",
         avg(sum[0]),
         "",
         avg(sum[1]),
@@ -284,6 +205,7 @@ pub fn run(path: &Path) -> Result<(), String> {
         avg(sum[3]),
         avg(sum[4]),
         avg(sum[5]),
+        avg(sum[6]),
         png_bytes / 1024 / n
     );
     println!(

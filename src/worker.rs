@@ -1,18 +1,19 @@
 //! The background threads.
 //!
-//! The render worker owns pdfium (which is not thread-safe): it opens the
-//! document, renders strips in the order the main thread asks, and runs
-//! searches. For a local terminal it renders straight into shared memory and
-//! is done; for PNG and zlib, a pool of encoder threads compresses strips
-//! while the worker renders the next ones. The writer owns terminal output,
-//! so the main thread never blocks on a slow SSH link: small frames
-//! (placements, the status line) jump ahead of queued image uploads, and
-//! uploads nobody needs any more are dropped before they are sent.
+//! The render worker owns the document (MuPDF uses a document from one
+//! thread at a time): it opens it, interprets each page once into a display
+//! list, hands strips to the render pool in the order the main thread asks,
+//! and runs searches. The pool's threads render strips from those display
+//! lists in parallel, each straight into shared memory for a terminal on this
+//! machine, or into a buffer they then compress to PNG or zlib. The writer
+//! owns terminal output, so the main thread never blocks on a slow SSH link:
+//! small frames (placements, the status line) jump ahead of queued image
+//! uploads, and uploads nobody needs any more are dropped before they are sent.
 
 use crate::encode::{self, Payload, ShmBuf, Transport};
-use crate::pdfium::{Doc, Entry, Page};
+use crate::mupdf::{Doc, Entry, Page};
 use crate::term;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
@@ -91,7 +92,7 @@ struct Queue {
 type Shared = Arc<(Mutex<Queue>, Condvar)>;
 
 pub struct Worker {
-    q: Arc<(Mutex<Queue>, Condvar)>,
+    q: Shared,
 }
 
 fn send(tx: &Sender<Event>, wake: RawFd, e: Event) {
@@ -101,10 +102,10 @@ fn send(tx: &Sender<Event>, wake: RawFd, e: Event) {
 
 impl Worker {
     pub fn spawn(path: PathBuf, tx: Sender<Event>, wake: RawFd) -> Worker {
-        let q: Arc<(Mutex<Queue>, Condvar)> = Arc::default();
+        let q: Shared = Arc::default();
         let q2 = q.clone();
         std::thread::Builder::new()
-            .name("render".into())
+            .name("worker".into())
             .spawn(move || render_loop(path, q2, tx, wake))
             .expect("spawning the render thread");
         Worker { q }
@@ -127,9 +128,9 @@ impl Worker {
     }
 }
 
-fn render_loop(path: PathBuf, q: Arc<(Mutex<Queue>, Condvar)>, tx: Sender<Event>, wake: RawFd) {
+fn render_loop(path: PathBuf, q: Shared, tx: Sender<Event>, wake: RawFd) {
     let open = || -> Result<Doc, String> {
-        crate::pdfium::init()?;
+        crate::mupdf::init()?;
         let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         Doc::open(bytes).map_err(|e| format!("{}: {e}", path.display()))
     };
@@ -140,19 +141,20 @@ fn render_loop(path: PathBuf, q: Arc<(Mutex<Queue>, Condvar)>, tx: Sender<Event>
         }
         Err(e) => return send(&tx, wake, Event::Doc(Err(e))),
     };
-    // Loaded pages, most recent last. Rendering several strips of one page
-    // reuses its parsed content.
-    let mut pages: Vec<(u32, Page)> = Vec::new();
+    // Display lists of recent pages, most recent last: each page is
+    // interpreted once, however many strips it is cut into.
+    let mut pages: Vec<(u32, Arc<Page>)> = Vec::new();
     // The outline is read once the first screen is rendered and there is
     // nothing else to do, so the first screen never waits for it (a book's
     // can be long).
     let (mut outline_due, mut rendered) = (true, false);
-    let mut pool: Option<Pool> = None;
-    let mut cuts: HashMap<(u32, u32), Cut> = HashMap::new();
+    let pool = Pool::spawn(q.clone(), tx.clone(), wake);
+    // Pages found heavy with images: their strips render on the pool.
+    let mut heavy: HashSet<u32> = HashSet::new();
 
     enum Work {
         Job(Job),
-        Strips(Vec<StripJob>),
+        Strip(StripJob),
         Outline,
     }
     loop {
@@ -164,13 +166,7 @@ fn render_loop(path: PathBuf, q: Arc<(Mutex<Queue>, Condvar)>, tx: Sender<Event>
                 }
                 if let Some(s) = g.strips.pop_front() {
                     g.busy.insert(s.key);
-                    let most = match (s.key.thumb, cuts.get(&(s.key.gen, s.key.page))) {
-                        (true, _) | (false, None | Some(Cut::Single)) => 1,
-                        (false, Some(Cut::Once(_))) => 2,
-                        (false, Some(Cut::Bands)) => usize::MAX,
-                    };
-                    let band = take_band(&mut g, s, most);
-                    break Work::Strips(band);
+                    break Work::Strip(s);
                 }
                 if outline_due && rendered {
                     break Work::Outline;
@@ -178,28 +174,24 @@ fn render_loop(path: PathBuf, q: Arc<(Mutex<Queue>, Condvar)>, tx: Sender<Event>
                 g = q.1.wait(g).unwrap();
             }
         };
-        let band = match work {
+        match work {
             Work::Outline => {
                 outline_due = false;
                 let t = Instant::now();
                 let outline = doc.outline(&doc.page_sizes());
                 debug_log!("outline: {} entries in {:.1} ms", outline.len(), ms(t.elapsed()));
                 send(&tx, wake, Event::Outline(outline));
-                continue;
             }
-            Work::Job(Job::Reload) => {
-                match open() {
-                    Ok(d) => {
-                        pages.clear();
-                        cuts.clear();
-                        doc = d;
-                        (outline_due, rendered) = (true, false);
-                        send(&tx, wake, Event::Doc(Ok(doc.page_sizes())));
-                    }
-                    Err(e) => send(&tx, wake, Event::Doc(Err(e))),
+            Work::Job(Job::Reload) => match open() {
+                Ok(d) => {
+                    pages.clear();
+                    heavy.clear();
+                    doc = d;
+                    (outline_due, rendered) = (true, false);
+                    send(&tx, wake, Event::Doc(Ok(doc.page_sizes())));
                 }
-                continue;
-            }
+                Err(e) => send(&tx, wake, Event::Doc(Err(e))),
+            },
             Work::Job(Job::Find {
                 seq,
                 needle,
@@ -211,196 +203,180 @@ fn render_loop(path: PathBuf, q: Arc<(Mutex<Queue>, Condvar)>, tx: Sender<Event>
                 let hit = (0..n)
                     .map(|i| if backward { (from + n - i) % n } else { (from + i) % n })
                     .find_map(|i| {
-                        let found = doc.page(i)?.find(&needle, match_case);
+                        let cached = pages.iter().find(|(p, _)| *p as usize == i).map(|(_, l)| l.clone());
+                        let page = cached.or_else(|| doc.page(i).map(Arc::new))?;
+                        let found = page.find(&needle, match_case);
                         (!found.is_empty()).then_some((i, found))
                     });
                 send(&tx, wake, Event::Found { seq, hit });
-                continue;
             }
-            Work::Strips(band) => band,
-        };
-        rendered = true;
-        let page = band[0].key.page;
-        if !pages.iter().any(|(i, _)| *i == page) {
-            if let Some(p) = doc.page(page as usize) {
-                if pages.len() >= 3 {
-                    pages.remove(0);
-                }
-                pages.push((page, p));
-            }
-        }
-        let Some((_, p)) = pages.iter().find(|(i, _)| *i == page) else {
-            let mut g = q.0.lock().unwrap();
-            for s in &band {
-                g.busy.remove(&s.key);
-            }
-            continue;
-        };
-        let t = Instant::now();
-        let mut pieces: Vec<(StripJob, Vec<u8>)> = Vec::new();
-        let (key, n, px) = (
-            band[0].key,
-            band.len(),
-            band.iter().map(|s| s.bw as f64 * s.bh as f64).sum::<f64>(),
-        );
-        if let [s] = &band[..] {
-            // One strip: a local terminal reads it where it was rendered.
-            let len = s.bw as usize * s.bh as usize * 3;
-            if s.transport == Transport::Shm {
-                if let Some(mut buf) = ShmBuf::new(len) {
-                    p.render_into(buf.pixels(), s.bw, s.bh, s.dx, s.dy, s.size_w, s.size_h);
-                    let render = t.elapsed();
-                    learn(&mut cuts, key, n, px, render);
-                    finish_pixels(buf.pixels(), s);
-                    log_strip(s, render, Duration::ZERO, 0, buf.pixels());
-                    let payload = buf.payload(s.id, s.bw, s.bh);
-                    send(&tx, wake, Event::Strip(s.key, s.id, Arc::new(payload)));
+            Work::Strip(s) => {
+                rendered = true;
+                let n = s.key.page;
+                let found = pages.iter().position(|(p, _)| *p == n);
+                let page = match found {
+                    Some(i) => Some(pages[i].1.clone()),
+                    None => {
+                        let t = Instant::now();
+                        let page = doc.page(n as usize).map(Arc::new);
+                        debug_log!("page {}: interpreted in {:.1} ms", n + 1, ms(t.elapsed()));
+                        if let Some(p) = &page {
+                            if pages.len() >= 8 {
+                                pages.remove(0);
+                            }
+                            pages.push((n, p.clone()));
+                        }
+                        page
+                    }
+                };
+                let Some(page) = page else {
                     q.0.lock().unwrap().busy.remove(&s.key);
                     continue;
-                }
-            }
-            let mut rgb = vec![0u8; len];
-            p.render_into(&mut rgb, s.bw, s.bh, s.dx, s.dy, s.size_w, s.size_h);
-            pieces.push((band.into_iter().next().expect("one strip"), rgb));
-        } else {
-            // Strips one below the other, in one call, then cut apart.
-            let s0 = &band[0];
-            let h: u32 = band.iter().map(|s| s.bh).sum();
-            let row = s0.bw as usize * 3;
-            let mut all = vec![0u8; row * h as usize];
-            p.render_into(&mut all, s0.bw, h, s0.dx, s0.dy, s0.size_w, s0.size_h);
-            let mut at = 0;
-            for s in band {
-                let len = row * s.bh as usize;
-                pieces.push((s, all[at..at + len].to_vec()));
-                at += len;
-            }
-        }
-        learn(&mut cuts, key, n, px, t.elapsed());
-        let render = t.elapsed() / pieces.len() as u32;
-        for (s, mut rgb) in pieces {
-            finish_pixels(&mut rgb, &s);
-            if s.transport == Transport::Shm {
-                if let Some(mut buf) = ShmBuf::new(rgb.len()) {
-                    buf.pixels().copy_from_slice(&rgb);
-                    log_strip(&s, render, Duration::ZERO, 0, &rgb);
-                    let payload = buf.payload(s.id, s.bw, s.bh);
-                    send(&tx, wake, Event::Strip(s.key, s.id, Arc::new(payload)));
-                    q.0.lock().unwrap().busy.remove(&s.key);
+                };
+                // Pages heavy with images (a scan) render in parallel on the
+                // pool. Text renders fastest here, one strip after another:
+                // MuPDF's locks make threads wait on each other when each
+                // strip is quick. Sends wait while every pool thread is busy,
+                // so the queue the main thread rewrites stays where the
+                // choosing is.
+                if heavy.contains(&n) {
+                    let _ = pool.tx.send(Task::Render { job: s, page });
                     continue;
                 }
-            }
-            // Shared memory that failed falls back to PNG.
-            let transport = if s.transport == Transport::Shm {
-                Transport::Png
-            } else {
-                s.transport
-            };
-            let pool = pool.get_or_insert_with(|| Pool::spawn(q.clone(), tx.clone(), wake));
-            let _ = pool.tx.send(Encode {
-                job: s,
-                rgb,
-                render,
-                transport,
-            });
-        }
-    }
-}
-
-/// Image bytes rendered in one call at most. pdfium redoes some of the work
-/// for an image on every call when it scales it up (a scanned page on a big
-/// display, or zoomed), so several strips in one call can be much faster: a
-/// scanned page 5700 px wide took 410 ms strip by strip, 130 ms eight strips
-/// at a time and 100 ms whole. Text pages cost the same either way, and
-/// single strips reach the terminal sooner (2026-10-24).
-const BAND_BYTES: usize = 32 << 20;
-
-/// How a page is best rendered, learned from its first calls.
-#[derive(Clone, Copy)]
-enum Cut {
-    /// One strip took this long per pixel (ms); two at once come next.
-    Once(f64),
-    /// Two at once were not much cheaper per pixel: one strip at a time.
-    Single,
-    /// They were: as many as BAND_BYTES allows.
-    Bands,
-}
-
-fn learn(cuts: &mut HashMap<(u32, u32), Cut>, key: StripKey, n: usize, px: f64, took: Duration) {
-    if key.thumb {
-        return;
-    }
-    if cuts.len() > 4096 {
-        cuts.clear();
-    }
-    let per = ms(took) / px.max(1.0);
-    let at = (key.gen, key.page);
-    match (cuts.get(&at).copied(), n) {
-        (None, 1) => {
-            cuts.insert(at, Cut::Once(per));
-        }
-        (Some(Cut::Once(one)), 2) => {
-            let cut = if per < one * 0.7 { Cut::Bands } else { Cut::Single };
-            debug_log!(
-                "page {}: {:.2} us/kpx alone, {:.2} two at once: {}",
-                key.page + 1,
-                one * 1e6,
-                per * 1e6,
-                if matches!(cut, Cut::Bands) {
-                    "bands"
-                } else {
-                    "single strips"
+                let len = s.bw as usize * s.bh as usize * 3;
+                let kpx = (s.bw as f64 * s.bh as f64 / 1e3).max(1.0);
+                let t = Instant::now();
+                let shm = (s.transport == Transport::Shm).then(|| ShmBuf::new(len)).flatten();
+                let took = match shm {
+                    Some(mut buf) => {
+                        page.render_into(buf.pixels(), s.bw, s.bh, s.dx, s.dy, s.size_w, s.size_h);
+                        let took = t.elapsed();
+                        finish_pixels(buf.pixels(), &s);
+                        log_strip(&s, took, Duration::ZERO, 0, buf.pixels());
+                        let payload = buf.payload(s.id, s.bw, s.bh);
+                        send(&tx, wake, Event::Strip(s.key, s.id, Arc::new(payload)));
+                        q.0.lock().unwrap().busy.remove(&s.key);
+                        took
+                    }
+                    None => {
+                        let mut rgb = vec![0u8; len];
+                        page.render_into(&mut rgb, s.bw, s.bh, s.dx, s.dy, s.size_w, s.size_h);
+                        let took = t.elapsed();
+                        finish_pixels(&mut rgb, &s);
+                        let _ = pool.tx.send(Task::Encode {
+                            job: s,
+                            rgb,
+                            render: took,
+                        });
+                        took
+                    }
+                };
+                let cost = took.as_secs_f64() * 1e6 / kpx;
+                if cost > HEAVY_US_PER_KPX {
+                    debug_log!("page {}: heavy ({cost:.1} us/kpx), rendered in parallel", n + 1);
+                    heavy.insert(n);
                 }
-            );
-            cuts.insert(at, cut);
+            }
         }
-        _ => {}
     }
 }
 
-/// `first`, and the queued strips right below it on its page (same tile,
-/// next rows), `most` strips and BAND_BYTES at most: all to be rendered in
-/// one call.
-fn take_band(q: &mut Queue, first: StripJob, most: usize) -> Vec<StripJob> {
-    let mut band = vec![first];
-    let mut bytes = band[0].bw as usize * band[0].bh as usize * 3;
-    while band.len() < most {
-        let last = band.last().expect("not empty");
-        // Only what is wanted next: the queue is in order of need, so look
-        // past the other tiles of these rows, but no further than this page,
-        // and stop at a strip of this tile that is wanted sooner.
-        let mut next = None;
-        for (i, j) in q.strips.iter().enumerate() {
-            let (a, b) = (&j.key, &last.key);
-            if a.thumb || (a.gen, a.page) != (b.gen, b.page) {
-                break;
-            }
-            if a.t != b.t {
-                continue;
-            }
-            let below = (a.ver, a.k) == (b.ver, b.k + 1)
-                && (j.bw, j.dx, j.dy) == (last.bw, last.dx, last.dy - last.bh as i32)
-                && (j.size_w, j.size_h, j.transport) == (last.size_w, last.size_h, last.transport);
-            if below {
-                next = Some(i);
-            }
-            break;
-        }
-        let Some(i) = next else { break };
-        let size = q.strips[i].bw as usize * q.strips[i].bh as usize * 3;
-        if bytes + size > BAND_BYTES {
-            break;
-        }
-        bytes += size;
-        let j = q.strips.remove(i).expect("found");
-        q.busy.insert(j.key);
-        band.push(j);
-    }
-    band
-}
+/// Microseconds per thousand pixels above which a page's strips render in
+/// parallel: text takes about 1 (0.5 ms for a strip of 2489x252), a scanned
+/// page 13-30, mostly decoding its image again for each strip.
+const HEAVY_US_PER_KPX: f64 = 5.0;
 
 fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1e3
+}
+
+/// Work for the pool: a strip of a heavy page to render (and compress), or a
+/// strip the worker rendered, to compress.
+enum Task {
+    Render {
+        job: StripJob,
+        page: Arc<Page>,
+    },
+    Encode {
+        job: StripJob,
+        rgb: Vec<u8>,
+        render: Duration,
+    },
+}
+
+/// Pool threads, for what takes long: rendering pages heavy with images in
+/// parallel, and compressing strips to PNG or zlib (which takes longer than
+/// rendering text) while the worker renders the next ones.
+struct Pool {
+    tx: SyncSender<Task>,
+}
+
+impl Pool {
+    fn spawn(q: Shared, events: Sender<Event>, wake: RawFd) -> Pool {
+        let n = std::thread::available_parallelism()
+            .map_or(4, |n| n.get())
+            .saturating_sub(2)
+            .clamp(1, 8);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Task>(n);
+        let rx: Arc<Mutex<Receiver<Task>>> = Arc::new(Mutex::new(rx));
+        for i in 0..n {
+            let (rx, q, events) = (rx.clone(), q.clone(), events.clone());
+            std::thread::Builder::new()
+                .name(format!("pool{i}"))
+                .spawn(move || loop {
+                    let Ok(task) = rx.lock().unwrap().recv() else { return };
+                    let (s, payload) = match task {
+                        Task::Render { job, page } => {
+                            let p = render(&page, &job);
+                            (job, p)
+                        }
+                        Task::Encode { job, rgb, render } => {
+                            let t = Instant::now();
+                            let transport = match job.transport {
+                                Transport::Shm => Transport::Png, // shared memory failed
+                                t => t,
+                            };
+                            let p = encode::transmit(transport, job.id, &rgb, job.bw, job.bh);
+                            log_strip(&job, render, t.elapsed(), p.bytes.len(), &rgb);
+                            (job, p)
+                        }
+                    };
+                    send(&events, wake, Event::Strip(s.key, s.id, Arc::new(payload)));
+                    q.0.lock().unwrap().busy.remove(&s.key);
+                })
+                .expect("spawning a pool thread");
+        }
+        debug_log!("{n} pool threads");
+        Pool { tx }
+    }
+}
+
+/// Renders strip `s` and wraps it for the terminal.
+fn render(page: &Page, s: &StripJob) -> Payload {
+    let len = s.bw as usize * s.bh as usize * 3;
+    let t = Instant::now();
+    // A terminal on this machine reads the strip where it was rendered.
+    if s.transport == Transport::Shm {
+        if let Some(mut buf) = ShmBuf::new(len) {
+            page.render_into(buf.pixels(), s.bw, s.bh, s.dx, s.dy, s.size_w, s.size_h);
+            finish_pixels(buf.pixels(), s);
+            log_strip(s, t.elapsed(), Duration::ZERO, 0, buf.pixels());
+            return buf.payload(s.id, s.bw, s.bh);
+        }
+    }
+    let mut rgb = vec![0u8; len];
+    page.render_into(&mut rgb, s.bw, s.bh, s.dx, s.dy, s.size_w, s.size_h);
+    finish_pixels(&mut rgb, s);
+    let rendered = t.elapsed();
+    // Shared memory that failed falls back to PNG.
+    let transport = if s.transport == Transport::Shm {
+        Transport::Png
+    } else {
+        s.transport
+    };
+    let payload = encode::transmit(transport, s.id, &rgb, s.bw, s.bh);
+    log_strip(s, rendered, t.elapsed() - rendered, payload.bytes.len(), &rgb);
+    payload
 }
 
 /// Search highlights, inversion, and the background around a thumbnail.
@@ -428,50 +404,6 @@ fn log_strip(s: &StripJob, render: Duration, encode: Duration, bytes: usize, rgb
         bytes / 1024,
         crate::debug_crc(rgb)
     );
-}
-
-/// A strip rendered, waiting to be encoded.
-struct Encode {
-    job: StripJob,
-    rgb: Vec<u8>,
-    render: Duration,
-    transport: Transport,
-}
-
-/// Encoder threads: PNG and zlib take longer than rendering (16-18 ms a page
-/// against 7-9 ms, for a paper on half a 5K display), so several encode
-/// while the worker renders the next strips.
-struct Pool {
-    tx: SyncSender<Encode>,
-}
-
-impl Pool {
-    fn spawn(q: Shared, events: Sender<Event>, wake: RawFd) -> Pool {
-        let n = std::thread::available_parallelism()
-            .map_or(4, |n| n.get())
-            .saturating_sub(2)
-            .clamp(1, 8);
-        // A short queue: when encoders fall behind, the worker waits rather
-        // than piling up rendered strips.
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Encode>(n * 2);
-        let rx: Arc<Mutex<Receiver<Encode>>> = Arc::new(Mutex::new(rx));
-        for i in 0..n {
-            let (rx, q, events) = (rx.clone(), q.clone(), events.clone());
-            std::thread::Builder::new()
-                .name(format!("encode{i}"))
-                .spawn(move || loop {
-                    let Ok(e) = rx.lock().unwrap().recv() else { return };
-                    let t = Instant::now();
-                    let payload = encode::transmit(e.transport, e.job.id, &e.rgb, e.job.bw, e.job.bh);
-                    log_strip(&e.job, e.render, t.elapsed(), payload.bytes.len(), &e.rgb);
-                    send(&events, wake, Event::Strip(e.job.key, e.job.id, Arc::new(payload)));
-                    q.0.lock().unwrap().busy.remove(&e.job.key);
-                })
-                .expect("spawning an encoder thread");
-        }
-        debug_log!("{n} encoder threads");
-        Pool { tx }
-    }
 }
 
 /// Marks search hits like a highlighter pen: multiply by yellow, so white

@@ -3,7 +3,7 @@ name = "farleaf-dev"
 version = "0.0.0"
 edition = "2021"
 description = "farleaf's development tools: a fake terminal, the stress test, sample PDFs and the demo GIF"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 publish = false
 
 [dependencies]

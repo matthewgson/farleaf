@@ -31,7 +31,7 @@ fn debug_crc(rgb: &[u8]) -> u32 {
 mod bench;
 mod encode;
 mod layout;
-mod pdfium;
+mod mupdf;
 mod sidebar;
 mod term;
 mod worker;
@@ -96,7 +96,6 @@ fn usage() -> String {
     }
     s + &format!(
         "\n{COUNT_NOTE}\n\nenvironment\n\
-         \x20 FARLEAF_PDFIUM       path to libpdfium (.dylib/.so) if not found otherwise\n\
          \x20 FARLEAF_TRANSPORT    force shm, png or zlib (default: probed)"
     )
 }
@@ -359,7 +358,7 @@ struct App {
     path: PathBuf,
     name: String,
     sizes: Vec<(f32, f32)>,
-    outline: Vec<pdfium::Entry>,
+    outline: Vec<mupdf::Entry>,
     /// The outline has been read (it comes after the first screen).
     outline_ready: bool,
     side: Option<Side>,
@@ -1331,7 +1330,7 @@ impl App {
                 }
             }
             Kind::Outline => {
-                if let Some(&pdfium::Entry {
+                if let Some(&mupdf::Entry {
                     page: Some(p), frac, ..
                 }) = self.outline.get(sel)
                 {

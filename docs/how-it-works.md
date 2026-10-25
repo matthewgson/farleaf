@@ -1,8 +1,8 @@
 # How farleaf works
 
-farleaf renders pages with pdfium on a worker thread and sends them to the
-terminal as Kitty graphics images. Everything else follows from what terminals
-can hold and how fast the link is.
+farleaf renders pages with MuPDF, compiled in, and sends them to the terminal
+as Kitty graphics images. Everything else follows from what terminals can hold
+and how fast the link is.
 
 ## Pages go out in pieces
 
@@ -48,25 +48,31 @@ a hole cut out of the page images, so opening it sends no images.
 ## Where the time goes
 
 `farleaf --bench paper.pdf` times each stage. For a paper on half a 5K display
-(pages 2489 px wide, 24 MB of pixels each), per page, on one core of an M2 Max:
+(pages 2489 px wide, 24 MB of pixels each), per page, on an M2 Max:
 
 | stage | ms | |
 |---|---|---|
-| load the page | 1 | pdfium parses it once, then the worker keeps it |
-| render it, strip by strip | 7.8 | straight into RGB order: no reordering pass (it was 9.3) |
-| PNG (over SSH) | 17 | 0.48 MB; on 8 encoder threads, while the next strips render |
-| zlib (herdr) | 15 | level 2 (level 3 took 18 for 3% fewer bytes) |
+| interpret the page | 1.3 | once, into a display list every strip renders from |
+| render it, strip by strip | 3.8 (6.3 cold) | straight into the terminal's shared memory, locally |
+| PNG (over SSH) | 15 | 0.33 MB; on the pool, while the next strips render |
+| zlib (herdr) | 12 | level 2 (level 3 took a fifth longer for 3% fewer bytes) |
 
+- Each page is interpreted once into a MuPDF display list, which any number of
+  threads can render at once.
+- Text renders fastest on one thread: each strip takes a fraction of a
+  millisecond, and MuPDF's locks (its allocator, its glyph cache) make threads
+  wait on each other, so 8 threads took twice as long as one. The worker
+  renders text strips itself and hands PNG and zlib, which take longer than
+  rendering, to the pool.
+- Pages heavy with images (a scan) render on the pool, in parallel. farleaf
+  times each page's first strip: text takes about 1 µs per thousand pixels, a
+  scan over 10, and anything over 5 counts as heavy.
+- MuPDF decodes only the part of an image a draw needs, by default, and caches
+  it under that part, so each strip of a scan decoded the scan again. farleaf
+  has it decode whole images (up to 64 million pixels) once, for every strip
+  to share: a scanned page went from 257 to 107 ms on one thread.
 - For a terminal on the same machine, strips are rendered straight into the
   shared memory the terminal reads: nothing is encoded or copied.
-- PNG and zlib take twice as long as rendering, so a pool of encoder threads
-  compresses strips in parallel while the worker renders the next ones.
-- pdfium redoes part of the work for an image it scales up on every call, so a
-  scanned page on a whole 5K display took 410 ms strip by strip against 100 ms
-  in one call. farleaf times the first two calls on each page and, when two
-  strips at once cost much less per pixel than one, renders the rest of the
-  page in bands of several strips. Text pages cost the same either way and
-  keep going strip by strip, which gets the first strips out sooner.
 - The outline is read after the first screen is drawn.
 - Over SSH the link, not the computer, sets the pace: a page is 0.3-1.3 MB of
   PNG, and a 9 MB/s link needs 30-140 ms for it. Row filters (Sub, Up, Paeth,
@@ -75,18 +81,25 @@ a hole cut out of the page images, so opening it sends no images.
 
 ## The PDF engine
 
-pdfium (Chrome's) renders the paper above at 7 ms a page and the scanned one at
-53 ms. Poppler's `pdftoppm`, at the same size, took about 75 ms and 370 ms (with
-writing its files). MuPDF is often faster than pdfium, but it is AGPL, which
-would make farleaf AGPL too, and it has no prebuilt shared library to load at
-run time, so building farleaf would need a C toolchain. With rendering a few
-milliseconds of a page turn and the rest prefetched, pdfium is not the
-bottleneck.
+MuPDF (since version 0.4.0) against pdfium, Chrome's engine, which farleaf used
+before: milliseconds to render a page, caches empty, strip by strip as farleaf
+draws it, on an M2 Max:
+
+| | paper, half 5K | paper, whole 5K | scan, half 5K | scan, whole 5K |
+|---|---|---|---|---|
+| pdfium | 7.8 | 34 | 66 | 130 |
+| MuPDF | **6.3** | **13** | 107 (one thread), **72** (8) | 157 (one thread), **65** (8) |
+
+Poppler's `pdftoppm` took about 75 and 370 ms for the half-5K paper and scan.
+The pictures look the same; MuPDF's PNGs of text are about 30% smaller (less
+to send over SSH), and of scans about 9% larger. MuPDF is AGPL, so farleaf is
+too; it is compiled in, which needs a C/C++ compiler to build farleaf but
+leaves nothing else to install.
 
 ## The sidebar
 
-The outline comes from the PDF's bookmarks (pdfium resolves each one to a page
-and a height on it), so it is there for any LaTeX paper built with hyperref.
+The outline comes from the PDF's bookmarks (MuPDF resolves each one to a page
+and a place on it), so it is there for any LaTeX paper built with hyperref.
 Thumbnails are images like the strips: rendered by the same worker, counted in
 the same memory budget, prefetched a few pages ahead, and painted on the
 sidebar's background so they blend in. Opening the sidebar narrows the pages;
@@ -110,16 +123,17 @@ with 50 ms round trips and compression, so 0.05 s is its floor):
 
 | | next page | jump | scroll |
 |---|---|---|---|
-| Ghostty, same machine: half / whole 5K display | 0.00 / 0.00 | 0.02 / 0.03 | 0.00 / 0.01 |
-| Ghostty over SSH: half a MacBook / whole 5K display | 0.05 / 0.15 | 0.11 / 0.13 | 0.05 |
-| herdr, same machine, half 5K display | 0.06 | 0.08 | 0.01 |
-| herdr over SSH, half a MacBook | 0.24 | 0.27 | 0.06 |
+| Ghostty, same machine: half / whole 5K display | 0.00 / 0.01 | 0.02 / 0.02 | 0.00 / 0.01 |
+| Ghostty over SSH: half a MacBook / whole 5K display | 0.05 / 0.13 | 0.10 / 0.12 | 0.05 |
+| herdr, same machine, half 5K display | 0.09 | 0.07 | 0.01 |
+| herdr over SSH, half a MacBook | 0.23 | 0.26 | 0.07 |
 
 A next page is usually prefetched, so it only moves images. In herdr over SSH
 the time grows with the pane's pixels because herdr re-sends each new image
 raw; farleaf's own part is a few tens of milliseconds. For a scanned paper on a
-whole 5K display, a jump takes 0.09 s and a resize 0.06 s (0.17 and 0.12 before
-the bands above).
+whole 5K display, a jump takes 0.02-0.03 s and a resize 0.02 s (0.07 each with
+pdfium); over SSH, where the scan's slightly larger PNGs count, a jump takes
+0.18 s (0.14 with pdfium).
 
 ## Lessons learned
 

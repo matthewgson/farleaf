@@ -2,7 +2,7 @@
 //! a thumbnail of every page. Thumbnails are images like the pages' strips;
 //! everything else here is text.
 
-use crate::pdfium::Entry;
+use crate::mupdf::Entry;
 use std::io::Write;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

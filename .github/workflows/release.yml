@@ -1,5 +1,6 @@
-# Push a tag like v0.1.0 to build farleaf for each platform, bundle it with
-# pdfium, and publish a GitHub release that install.sh downloads from.
+# Push a tag like v0.4.0 to build farleaf (with MuPDF compiled in) for each
+# platform and publish a GitHub release that install.sh downloads from. The
+# release also carries MuPDF's exact source, as the AGPL asks of binaries.
 # Run it by hand (workflow_dispatch) to build without releasing.
 name: release
 
@@ -19,13 +20,15 @@ jobs:
         include:
           - { platform: mac-arm64, os: macos-latest, target: aarch64-apple-darwin }
           - { platform: mac-x64, os: macos-latest, target: x86_64-apple-darwin }
-          # Linux: zig links against glibc 2.17, so the binary runs on old systems too.
-          - { platform: linux-x64, os: ubuntu-latest, target: x86_64-unknown-linux-gnu, glibc: ".2.17" }
-          - { platform: linux-arm64, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, glibc: ".2.17" }
+          # Linux: zig links against glibc 2.28 (2018), so the binary runs on
+          # older systems than the runner's.
+          - { platform: linux-x64, os: ubuntu-latest, target: x86_64-unknown-linux-gnu, glibc: ".2.28" }
+          - { platform: linux-arm64, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, glibc: ".2.28" }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - run: rustup target add ${{ matrix.target }}
+      - run: scripts/fetch-mupdf.sh
       - name: Build
         run: |
           if [ -n "${{ matrix.glibc }}" ]; then
@@ -39,10 +42,17 @@ jobs:
       - name: Package
         run: |
           d=dist/farleaf-${{ matrix.platform }}
-          mkdir -p "$d/pdfium-licenses"
-          scripts/fetch-pdfium.sh ${{ matrix.platform }} "$RUNNER_TEMP/pdfium"
-          cp target/${{ matrix.target }}/release/farleaf "$RUNNER_TEMP"/pdfium/lib/libpdfium.* LICENSE README.md "$d/"
-          cp -R "$RUNNER_TEMP/pdfium/LICENSE" "$RUNNER_TEMP"/pdfium/licenses/* "$d/pdfium-licenses/"
+          mu=vendor/mupdf-1.28.5-source
+          mkdir -p "$d/licenses/mupdf"
+          cp target/${{ matrix.target }}/release/farleaf LICENSE README.md "$d/"
+          cp "$mu/COPYING" "$d/licenses/mupdf/"
+          # The libraries inside MuPDF that this build includes.
+          for lib in brotli cmark-gfm extract freetype gumbo-parser harfbuzz jbig2dec lcms2 libjpeg mujs openjpeg zlib; do
+            mkdir -p "$d/licenses/$lib"
+            for f in "$mu/thirdparty/$lib"/LICENSE* "$mu/thirdparty/$lib"/COPYING* "$mu/thirdparty/$lib"/README; do
+              if [ -f "$f" ]; then cp "$f" "$d/licenses/$lib/"; fi
+            done
+          done
           tar -czf "$d.tar.gz" -C dist "farleaf-${{ matrix.platform }}"
       - name: Smoke test
         run: |
@@ -62,10 +72,17 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
+      - name: MuPDF's source
+        run: |
+          v=$(sed -n 's/^VERSION="\(.*\)"$/\1/p' scripts/fetch-mupdf.sh)
+          sum=$(sed -n 's/^SHA256="\(.*\)"$/\1/p' scripts/fetch-mupdf.sh)
+          curl -fsSL -o "dist/mupdf-$v-source.tar.gz" "https://casper.mupdf.com/downloads/archive/mupdf-$v-source.tar.gz"
+          echo "$sum  dist/mupdf-$v-source.tar.gz" | sha256sum -c
       - run: cd dist && sha256sum *.tar.gz > SHA256SUMS && cat SHA256SUMS
       - name: Publish
         env:

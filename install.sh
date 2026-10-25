@@ -1,12 +1,12 @@
 #!/bin/sh
-# Install farleaf and the pdfium library it renders with, from GitHub releases.
+# Install farleaf from GitHub releases.
 #
 #   curl -fsSL https://raw.githubusercontent.com/matthewgson/farleaf/main/install.sh | sh
 #
-# Puts farleaf in $PREFIX/bin and pdfium in $PREFIX/lib/farleaf (PREFIX is
-# ~/.local unless FARLEAF_PREFIX says otherwise). FARLEAF_VERSION=v0.1.0 picks
-# a release; the default is the latest. No root needed. To uninstall:
-#   rm ~/.local/bin/farleaf && rm -r ~/.local/lib/farleaf
+# Puts farleaf in $PREFIX/bin and its licenses in $PREFIX/share/doc/farleaf
+# (PREFIX is ~/.local unless FARLEAF_PREFIX says otherwise). FARLEAF_VERSION=v0.4.0
+# picks a release; the default is the latest. No root needed. To uninstall:
+#   rm ~/.local/bin/farleaf && rm -r ~/.local/share/doc/farleaf
 set -eu
 
 repo=matthewgson/farleaf
@@ -51,14 +51,26 @@ fi
 
 tar -xzf "$tmp/$name" -C "$tmp"
 src=$tmp/farleaf-$platform
-mkdir -p "$prefix/bin" "$prefix/lib/farleaf"
-cp -R "$src/pdfium-licenses" "$prefix/lib/farleaf/"
+mkdir -p "$prefix/bin"
 # Each through a temporary name, so a farleaf that is running keeps its copy.
 put() {
     cp "$1" "$2/.$(basename "$1").new"
     mv -f "$2/.$(basename "$1").new" "$2/$(basename "$1")"
 }
-for lib in "$src"/libpdfium.*; do put "$lib" "$prefix/lib/farleaf"; done
+if ls "$src"/libpdfium.* >/dev/null 2>&1; then
+    # Releases before 0.4.0 render with pdfium, a library beside the binary.
+    mkdir -p "$prefix/lib/farleaf"
+    cp -R "$src/pdfium-licenses" "$prefix/lib/farleaf/"
+    for lib in "$src"/libpdfium.*; do put "$lib" "$prefix/lib/farleaf"; done
+else
+    # MuPDF is inside the binary; pdfium from an older install is not needed.
+    if [ -f "$prefix/lib/farleaf/libpdfium.dylib" ] || [ -f "$prefix/lib/farleaf/libpdfium.so" ]; then
+        rm -rf "$prefix/lib/farleaf"
+    fi
+    mkdir -p "$prefix/share/doc/farleaf"
+    cp "$src/LICENSE" "$prefix/share/doc/farleaf/"
+    cp -R "$src/licenses" "$prefix/share/doc/farleaf/"
+fi
 put "$src/farleaf" "$prefix/bin"
 
 echo "installed $("$prefix/bin/farleaf" --version) in $prefix/bin"

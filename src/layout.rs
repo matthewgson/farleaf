@@ -209,7 +209,7 @@ impl Layout {
     }
 
     /// The bitmap of piece (`k`, `t`): its size, and where the page's
-    /// top-left corner sits in it (see pdfium::Page::render).
+    /// top-left corner sits in it (see mupdf::Page::render).
     pub fn piece(&self, page: usize, k: u32, t: u32) -> (u32, u32, i32, i32) {
         let p = &self.pages[page];
         let g = &self.geom;

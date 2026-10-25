@@ -165,13 +165,15 @@ size does not change.
 
 \section{Implementation}
 
-\subsection{Two threads}
+\subsection{Threads}
 
-pdfium, the renderer, is not thread-safe, so a single worker thread owns it.
-The worker renders strips in the order the main thread asks for them: what is
-on screen first, then the rest of the page, then the next two pages and the
-previous one. When the reader moves on, the queue is replaced, and strips that
-are no longer wanted are never rendered.
+MuPDF, the renderer, uses a document from one thread at a time, so a single
+worker thread owns it. The worker interprets each page once and renders strips
+in the order the main thread asks for them: what is on screen first, then the
+rest of the page, then the next two pages and the previous one. Pages heavy
+with images, such as scans, are rendered by several threads at once. When the
+reader moves on, the queue is replaced, and strips that are no longer wanted
+are never rendered.
 
 A second thread owns the terminal. Small frames, which place images and draw
 the status line, jump ahead of queued uploads, so a key always gets an answer

@@ -6,9 +6,10 @@ and inside [herdr](https://herdr.dev).
 
 ![farleaf: page thumbnails, the outline, search and the key list](docs/demo.gif)
 
-- Renders with [pdfium](https://pdfium.googlesource.com/pdfium/), Chrome's PDF engine.
+- Renders with [MuPDF](https://mupdf.com), compiled in: one binary, nothing
+  else to install. Pages heavy with images (scans) render on several cores.
 - Turning a page usually only moves images that are already in the terminal; a
-  jump to a new page is on screen in 20-30 ms locally, about 0.1 s over SSH.
+  jump to a new page is on screen in 10-30 ms locally, about 0.1 s over SSH.
 - Picks the fastest way to send images by asking the terminal at startup:
   shared memory locally, compressed images over SSH.
 - A sidebar with the outline (sections and subsections) or page thumbnails,
@@ -23,23 +24,22 @@ macOS (Apple Silicon or Intel) and Linux (x86_64 or arm64):
 curl -fsSL https://raw.githubusercontent.com/matthewgson/farleaf/main/install.sh | sh
 ```
 
-This puts `farleaf` in `~/.local/bin` and pdfium in `~/.local/lib/farleaf`,
-checking both against the release's checksums. No root needed. Set
-`FARLEAF_PREFIX` to install elsewhere, or `FARLEAF_VERSION=v0.1.0` for a
-specific release. To uninstall: `rm ~/.local/bin/farleaf && rm -r ~/.local/lib/farleaf`.
+This puts `farleaf` in `~/.local/bin` (checked against the release's
+checksums) and its licenses in `~/.local/share/doc/farleaf`. No root needed.
+Set `FARLEAF_PREFIX` to install elsewhere, or `FARLEAF_VERSION=v0.4.0` for a
+specific release. Linux needs glibc 2.28 or later. To uninstall:
+`rm ~/.local/bin/farleaf && rm -r ~/.local/share/doc/farleaf`.
 
 ### From source
 
-Needs Rust. pdfium is loaded at run time, so there is no C build.
+Needs Rust, `make` and a C/C++ compiler (MuPDF is C, with a little C++).
 
 ```sh
 git clone https://github.com/matthewgson/farleaf && cd farleaf
-scripts/fetch-pdfium.sh      # a pinned, checksummed pdfium build, into vendor/
-cargo build --release        # target/release/farleaf finds vendor/ by itself
+scripts/fetch-mupdf.sh       # MuPDF's source, pinned and checksummed, into vendor/
+cargo build --release        # compiles MuPDF too, about a minute the first time
+cp target/release/farleaf ~/.local/bin/
 ```
-
-To install it, copy `target/release/farleaf` to `~/.local/bin/` and
-`vendor/pdfium-*/lib/libpdfium.*` to `~/.local/lib/farleaf/`.
 
 ## Use
 
@@ -100,5 +100,9 @@ Host my-server
 
 ## License
 
-MIT. The release archives include pdfium, which is under the BSD 3-clause
-license and others (see `pdfium-licenses/` in each archive).
+farleaf is © 2026 Matthew G. Son, under the [GNU Affero General Public
+License](LICENSE), version 3 or later (AGPL-3.0-or-later). It is built with
+MuPDF, © Artifex Software, which is under the AGPL too; the libraries inside
+MuPDF have their own licenses, in `licenses/` in each release archive. Each
+release also carries MuPDF's exact source. Releases before 0.4.0, which
+rendered with pdfium, were MIT.
