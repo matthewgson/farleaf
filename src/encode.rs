@@ -189,6 +189,18 @@ pub fn place(out: &mut Vec<u8>, id: u32, p: u32, at: &[u32; 8]) {
     );
 }
 
+/// Puts placement `p` of image `id` one cell big at screen cell (row, col),
+/// below the text (z=-1), where an image on screen covers it: never seen,
+/// but a multiplexer that sends images on only once placed sends it.
+pub fn place_hidden(out: &mut Vec<u8>, id: u32, p: u32, row: u32, col: u32) {
+    let _ = write!(
+        out,
+        "\x1b[{};{}H\x1b_Ga=p,i={id},p={p},x=0,y=0,w=1,h=1,c=1,r=1,z=-1,C=1,q=1\x1b\\",
+        row + 1,
+        col + 1
+    );
+}
+
 /// Removes placement `p`, keeping the image for a later re-place.
 pub fn unplace(out: &mut Vec<u8>, id: u32, p: u32) {
     let _ = write!(out, "\x1b_Ga=d,d=i,i={id},p={p},q=2\x1b\\");

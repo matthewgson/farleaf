@@ -46,8 +46,13 @@ cp target/release/farleaf ~/.local/bin/
 ```sh
 farleaf paper.pdf
 farleaf -p 12 paper.pdf      # open at page 12
+farleaf -p 12:340 paper.pdf  # ... with the spot 340 pt from its top a third of the way down
 farleaf docs/demo/demo.pdf   # the paper in the GIF, in a clone of this repo
 ```
+
+The `12:340` form is for editors: `synctex view` gives a source line's page
+and height, so a LaTeX editor's forward search can open farleaf there, or type
+`:12:340` and Enter into a farleaf that is already open.
 
 Press `?` for the list of keys. A count works before most keys: `5j`, `3l`, `12G`.
 
@@ -69,7 +74,7 @@ Press `?` for the list of keys. A count works before most keys: `5j`, `3l`, `12G
 | `o` | the outline (contents) in a sidebar; again to hide it |
 | `t` | page thumbnails in a sidebar; again to hide them |
 | in the sidebar: `j` `k`, `Enter`, `Esc` | move (the page follows), stay there, go back to where you were |
-| `:12` `:q` `:noh` `:e` | go to page 12, quit, clear highlights, reload |
+| `:12` `:12:340` `:q` `:noh` `:e` | go to page 12 (at 340 pt from its top), quit, clear highlights, reload |
 | `r` | reload |
 | `?`, `:help` | the key list |
 | `q`, `Ctrl-c` | quit |

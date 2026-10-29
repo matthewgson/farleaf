@@ -3,7 +3,7 @@
 //!   cargo dev term [--cols 134 --rows 50 --cell 19x42] [--shm] [--out DIR]
 //!                  [--keys "1.0:j 2.0:snap:after-j 3.0:q"] [--timeout S]
 //!                  [--mbps N [--rtt MS] [--compress]] [--flog LOG]
-//!                  [--env NAME=VALUE ...] -- CMD ARGS...
+//!                  [--images-only] [--env NAME=VALUE ...] -- CMD ARGS...
 //!       a fake Kitty-graphics terminal: runs CMD in a pty, answers its
 //!       queries, types the keys, saves screenshots
 //!   cargo dev stress [...]       the stress test (see src/stress.rs)
@@ -12,7 +12,9 @@
 //!
 //! --keys is a list of TIME:KEYS (seconds from the start; KEYS may use \e,
 //! \r, \s for space and ^X for Ctrl+X), TIME:snap:NAME (save OUT/NAME.png),
-//! TIME:resize:COLSxROWS and TIME:check:NAME. --shm makes the terminal read
+//! TIME:resize:COLSxROWS, TIME:check:NAME and TIME:wait:NAME:QUIET (time NAME
+//! from here until the screen has been quiet QUIET s, e.g. a program
+//! started by keys typed into a shell). --shm makes the terminal read
 //! shared memory (t=s), like a Ghostty on the same machine. With --flog
 //! (farleaf's FARLEAF_LOG), every time the screen settles it checks that what
 //! is on screen is exactly what farleaf last drew.
@@ -62,6 +64,9 @@ fn parse_keys(spec: &str) -> Result<Vec<(f64, Step)>, String> {
             Step::Resize(c.parse().map_err(|_| "bad cols")?, r.parse().map_err(|_| "bad rows")?)
         } else if let Some(name) = rest.strip_prefix("check:") {
             Step::Check(name.into())
+        } else if let Some(w) = rest.strip_prefix("wait:") {
+            let (name, quiet) = w.split_once(':').ok_or(format!("{item}: want wait:NAME:QUIET"))?;
+            Step::Wait(name.into(), quiet.parse().map_err(|_| format!("{item}: bad quiet"))?)
         } else {
             Step::Keys(keybytes(rest))
         };
@@ -81,7 +86,7 @@ fn term(args: &[String]) -> Result<(), String> {
             cmd = args[i + 1..].to_vec();
             break;
         }
-        let flag = matches!(a, "--shm" | "--compress");
+        let flag = matches!(a, "--shm" | "--compress" | "--images-only");
         let v = if flag {
             ""
         } else {
@@ -99,6 +104,9 @@ fn term(args: &[String]) -> Result<(), String> {
             }
             "--shm" => o.shm = true,
             "--compress" => o.compress = true,
+            // Time keys by image changes only (text, like a multiplexer's
+            // own redraws, does not count).
+            "--images-only" => o.text_counts = false,
             "--out" => o.out = PathBuf::from(v),
             "--keys" => keys = v.to_string(),
             "--timeout" => o.timeout = n(v)?,

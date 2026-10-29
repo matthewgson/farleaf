@@ -60,6 +60,7 @@ const KEYS: &[(&str, &str)] = &[
     ("l h  J K", "next / previous page"),
     ("gg  G", "first page / end"),
     ("12G  12gg  :12", "page 12"),
+    (":12:340", "page 12, 340 pt from its top (SyncTeX)"),
     ("", "View"),
     ("z  Z", "fit page / fit width"),
     ("+  -", "zoom in / out"),
@@ -86,7 +87,11 @@ const KEYS: &[(&str, &str)] = &[
 const COUNT_NOTE: &str = "A count works before most keys: 5j, 3l, 12G.";
 
 fn usage() -> String {
-    let mut s = String::from("usage: farleaf [-p PAGE] FILE.pdf\n");
+    let mut s = String::from(
+        "usage: farleaf [-p PAGE[:Y]] FILE.pdf\n  \
+         (Y: a height on the page, in points from its top, shown a third of the\n  \
+         way down the screen; `synctex view` gives it. `:PAGE:Y` too.)\n",
+    );
     for (keys, what) in KEYS {
         if keys.is_empty() {
             s += &format!("\n{}\n", what.to_lowercase());
@@ -106,6 +111,32 @@ fn usage() -> String {
 const GHOSTTY_BUDGET: usize = 192 << 20;
 const HERDR_BUDGET: usize = 56 << 20;
 
+/// herdr sends an image on to the terminal (uncompressed, so over SSH this
+/// is most of a page turn) only once a placement of it is visible, and
+/// moving a placement later sends nothing. So under herdr every image
+/// farleaf holds is placed somewhere: on screen, or "hidden", one cell big
+/// under a page image (z < 0, below it), which makes herdr send it ahead of
+/// need. But what herdr sends queues ahead of the next key's images (and
+/// while herdr waits on its output it reads no keys), so warming must never
+/// keep herdr busy: farleaf counts how long what it makes herdr send should
+/// take (`send_time`), and places images hidden only once that is over and
+/// SETTLE has passed since the last key, in steps of about WARM_STEP.
+const HIDDEN_P: u32 = 1000;
+const WARM_STEP: Duration = Duration::from_millis(100);
+const SETTLE: Duration = Duration::from_millis(150);
+/// herdr, SSH's compression and the terminal handle a re-sent image raw:
+/// end to end that ran at 45-50 MB/s, both on a simulated link and on a
+/// cluster's; half that, to be safe. The link itself carries about the
+/// size farleaf sent the image at; LINK_RATE is a slow link.
+const RAW_RATE: f64 = 25e6;
+const LINK_RATE: f64 = 2.5e6;
+
+/// How long herdr should take to send on an image that the terminal holds
+/// as `mem` bytes and farleaf sent as `wire` (see RAW_RATE).
+fn send_time(mem: usize, wire: usize) -> Duration {
+    Duration::from_secs_f64(mem as f64 / RAW_RATE + wire as f64 / LINK_RATE)
+}
+
 fn main() {
     START.get_or_init(Instant::now);
     let mut args = std::env::args().skip(1);
@@ -114,7 +145,7 @@ fn main() {
         match a.as_str() {
             "-h" | "--help" => return println!("{}", usage()),
             "-V" | "--version" => return println!("farleaf {}", env!("CARGO_PKG_VERSION")),
-            "-p" | "--page" => page = args.next().and_then(|n| n.parse::<usize>().ok()),
+            "-p" | "--page" => page = args.next().and_then(|s| spot(&s)),
             "--bench" => bench = true,
             _ if file.is_none() && !a.starts_with('-') => file = Some(PathBuf::from(a)),
             _ => fail(&format!("unexpected argument {a:?}\n\n{}", usage())),
@@ -128,6 +159,16 @@ fn main() {
     if let Err(e) = result {
         fail(&e);
     }
+}
+
+/// "12" or "12:340.5": a page (from 1, returned from 0), and maybe a height
+/// on it, in points from its top.
+fn spot(s: &str) -> Option<(usize, Option<f32>)> {
+    let (p, y) = match s.split_once(':') {
+        Some((p, y)) => (p, Some(y.parse::<f32>().ok().filter(|y| y.is_finite())?)),
+        None => (s, None),
+    };
+    Some((p.parse::<usize>().ok()?.max(1) - 1, y))
 }
 
 fn fail(msg: &str) -> ! {
@@ -201,7 +242,7 @@ fn probe(tty: &mut Tty, parser: &mut Parser, try_shm: bool) -> Probe {
     p
 }
 
-fn run(path: PathBuf, start_page: Option<usize>) -> Result<(), String> {
+fn run(path: PathBuf, start: Option<(usize, Option<f32>)>) -> Result<(), String> {
     let (wake_r, wake_w) = term::wake_pipe().map_err(|e| e.to_string())?;
     let (tx, rx) = channel();
     let worker = Worker::spawn(path.clone(), tx.clone(), wake_w);
@@ -266,8 +307,9 @@ fn run(path: PathBuf, start_page: Option<usize>) -> Result<(), String> {
     let mut app = App::new(
         tty, wake_r, rx, worker, writer, transport, budget, path, sizes, probe.cell,
     );
-    if let Some(p) = start_page {
-        app.goto_page(p.saturating_sub(1), false);
+    app.herdr = herdr;
+    if let Some((p, y)) = start {
+        app.goto_spot(p, y, false);
     }
     for i in probe.early {
         app.input(i);
@@ -304,10 +346,16 @@ fn max_rss() -> u64 {
 enum St {
     /// Asked of the render worker under this image id.
     Rendering(u32),
-    /// Encoded and queued for upload; the terminal will hold this many bytes.
-    Queued(usize),
+    /// Encoded and queued for upload: the terminal will hold this many bytes,
+    /// sent as that many.
+    Queued(usize, usize),
     /// In the terminal, under this id; `seen` is the last frame it was on screen.
-    Shown { id: u32, mem: usize, seen: u64 },
+    Shown {
+        id: u32,
+        mem: usize,
+        wire: usize,
+        seen: u64,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -418,6 +466,21 @@ struct App {
     error: Option<String>,
     /// When the last key arrived, until the screen it asked for is complete.
     key_at: Option<Instant>,
+    /// Inside herdr (see HIDDEN_P).
+    herdr: bool,
+    /// Under herdr: images placed hidden, and the cell they are under.
+    hidden: HashMap<u32, (u32, u32)>,
+    /// Under herdr: images it has sent on to the terminal (placed, on screen
+    /// or hidden, ever since).
+    on_host: HashSet<u32>,
+    /// More images are waiting to be placed hidden.
+    warm_more: bool,
+    last_key: Option<Instant>,
+    /// The last frame lacked pieces that are on screen.
+    missing: bool,
+    /// When herdr should have sent on all farleaf made it send (see
+    /// `send_time`).
+    link_free: Instant,
 }
 
 fn file_stamp(path: &PathBuf) -> Option<(SystemTime, u64)> {
@@ -516,6 +579,13 @@ impl App {
             quit: false,
             error: None,
             key_at: None,
+            herdr: false,
+            hidden: HashMap::new(),
+            on_host: HashSet::new(),
+            warm_more: false,
+            last_key: None,
+            missing: false,
+            link_free: Instant::now(),
         };
         app.relayout(true);
         app.clear = false;
@@ -549,7 +619,11 @@ impl App {
         let fd = self.tty.fd();
         while !self.quit {
             self.update();
-            let timeout = if self.parser.pending() { 25 } else { 500 };
+            let mut timeout = if self.parser.pending() { 25 } else { 500 };
+            if let Some(at) = self.wake_at() {
+                let ms = at.saturating_duration_since(Instant::now()).as_millis();
+                timeout = timeout.min(ms.clamp(1, 500) as i32);
+            }
             let ready = term::poll(&[fd, self.wake_r], timeout);
             if ready[0] {
                 match term::read_some(fd, &mut buf) {
@@ -597,7 +671,9 @@ impl App {
         match i {
             Input::Key(k) => {
                 debug_log!("key {k:?}");
-                self.key_at = Some(Instant::now());
+                let now = Instant::now();
+                self.key_at = Some(now);
+                self.last_key = Some(now);
                 self.key(k)
             }
             Input::CellSize(w, h) if w > 0 && h > 0 => {
@@ -625,10 +701,12 @@ impl App {
             key.k,
             key.t
         );
-        if let Some(St::Queued(mem) | St::Shown { mem, .. }) = self.strips.remove(&key) {
+        if let Some(St::Queued(mem, _) | St::Shown { mem, .. }) = self.strips.remove(&key) {
             self.term_mem -= mem;
         }
         self.placed.retain(|k, _| k.0 != id);
+        self.hidden.remove(&id);
+        self.on_host.remove(&id);
         self.to_free.push(id);
         let n = self.failures.entry(key).or_insert(0);
         *n += 1;
@@ -646,7 +724,7 @@ impl App {
                 // Anything else is superseded; dropping it unlinks any shared memory.
                 if matches!(self.strips.get(&key), Some(St::Rendering(r)) if *r == id) {
                     self.make_room(payload.mem);
-                    self.strips.insert(key, St::Queued(payload.mem));
+                    self.strips.insert(key, St::Queued(payload.mem, payload.bytes.len()));
                     self.term_mem += payload.mem;
                     self.writer().upload(id, payload);
                 }
@@ -659,15 +737,17 @@ impl App {
                     return;
                 };
                 if let Some(st) = self.strips.get_mut(&key) {
-                    if let St::Queued(mem) = *st {
+                    if let St::Queued(mem, wire) = *st {
                         *st = St::Shown {
                             id,
                             mem,
+                            wire,
                             seen: self.tick,
                         };
                         if self.on_screen.contains(&key) {
                             self.dirty = true;
                         }
+                        self.warm_more |= self.herdr;
                     }
                 }
             }
@@ -704,7 +784,28 @@ impl App {
         }
     }
 
+    /// When hidden placements may next go out, under herdr (see HIDDEN_P):
+    /// SETTLE after the last key, once herdr has sent on the rest.
+    fn warm_from(&self) -> Instant {
+        self.last_key
+            .map_or(self.link_free, |t| (t + SETTLE).max(self.link_free))
+    }
+
+    /// Counts what herdr will send on, as the time it should take.
+    fn charge(&mut self, time: Duration) {
+        self.link_free = self.link_free.max(Instant::now()) + time;
+    }
+
+    /// The next time the loop must wake on its own: when more images can be
+    /// placed hidden.
+    fn wake_at(&self) -> Option<Instant> {
+        (self.warm_more && !self.missing).then(|| self.warm_from())
+    }
+
     fn housekeeping(&mut self) {
+        if self.warm_more && !self.missing && Instant::now() >= self.warm_from() {
+            self.dirty = true;
+        }
         if self
             .msg
             .as_ref()
@@ -779,6 +880,20 @@ impl App {
             self.push_jump();
         }
         self.top = self.layout.pages[p.min(self.layout.pages.len() - 1)].y;
+        self.clamp();
+    }
+
+    /// Page `p`, and with `y` (points from the page's top) that height a third
+    /// of the way down the screen: where SyncTeX says a line of source is.
+    fn goto_spot(&mut self, p: usize, y: Option<f32>, jump: bool) {
+        let Some(y) = y else { return self.goto_page(p, jump) };
+        if jump {
+            self.push_jump();
+        }
+        let p = p.min(self.layout.pages.len() - 1);
+        let b = self.layout.pages[p];
+        let at = (y / self.sizes[p].1.max(1.0)).clamp(0.0, 1.0) * b.rows as f32;
+        self.top = (b.y as f32 + at - (self.geom().rows / 3) as f32).round().max(0.0) as u32;
         self.clamp();
     }
 
@@ -899,7 +1014,7 @@ impl App {
                     self.to_free.push(id);
                     self.term_mem -= mem;
                 }
-                Some(St::Queued(mem)) => self.term_mem -= mem,
+                Some(St::Queued(mem, _)) => self.term_mem -= mem,
                 _ => {}
             }
         }
@@ -1077,8 +1192,8 @@ impl App {
     }
 
     fn command(&mut self, cmd: &str) {
-        if let Ok(n) = cmd.parse::<usize>() {
-            return self.goto_page(n.max(1) - 1, true);
+        if let Some((p, y)) = spot(cmd) {
+            return self.goto_spot(p, y, true);
         }
         match cmd {
             "q" | "q!" | "quit" | "wq" | "x" => self.quit = true,
@@ -1532,8 +1647,10 @@ impl App {
 
     /// What should be in the terminal, most wanted first: what is on screen
     /// (pages and thumbnails), then the rest of the pages on screen (nearest
-    /// strips first), the next two pages and the previous one, so a scroll or
-    /// a page turn usually finds its images already there, then the
+    /// strips first), the next page, the previous one and the one after next
+    /// (the previous before the second next, so going back a page stays quick
+    /// where memory is short, as in herdr), so a scroll or a page turn
+    /// usually finds its images already there, then the
     /// thumbnails just off the sidebar. It stops where the terminal's image
     /// memory would run out; past that, prefetching would only evict.
     fn wanted_keys(&self, vis: &[Visible], shown: &[ThumbAt]) -> Vec<StripKey> {
@@ -1575,7 +1692,8 @@ impl App {
             }
             near.sort_unstable();
             let n = self.layout.pages.len();
-            let pages = (last.page + 1..n).take(2).chain(first.page.checked_sub(1));
+            let next = |i: usize| (last.page + 1 + i < n).then_some(last.page + 1 + i);
+            let pages = next(0).into_iter().chain(first.page.checked_sub(1)).chain(next(1));
             let rest = pages.flat_map(|p| (0..self.layout.strips(p)).map(move |k| (0, p, k)));
             for (_, p, k) in near.into_iter().chain(rest) {
                 more.extend(self.layout.tiles_in_view(p, self.left).map(|t| self.key_of(p, k, t)));
@@ -1690,7 +1808,7 @@ impl App {
             let keep = |id: u32| self.by_id.get(&id).is_some_and(|k| wanted.contains(k));
             for id in self.writer().prune(keep) {
                 if let Some(k) = self.by_id.remove(&id) {
-                    if let Some(St::Queued(mem)) = self.strips.remove(&k) {
+                    if let Some(St::Queued(mem, _)) = self.strips.remove(&k) {
                         self.term_mem -= mem;
                     }
                 }
@@ -1731,6 +1849,8 @@ impl App {
             if let Some(St::Shown { id, mem, .. }) = self.strips.remove(&k) {
                 self.by_id.remove(&id);
                 self.placed.retain(|k, _| k.0 != id);
+                self.hidden.remove(&id);
+                self.on_host.remove(&id);
                 encode::free(&mut out, id);
                 self.term_mem -= mem;
             }
@@ -1740,6 +1860,59 @@ impl App {
         self.writer().frame(out);
     }
 
+    /// Under herdr: places every image held but not on screen hidden, under
+    /// the top-left cell of one that is (see HIDDEN_P). Those herdr has sent
+    /// already go at once, to keep them there; the others, most wanted first,
+    /// a step at a time once the screen is complete and has settled.
+    fn hide(&mut self, out: &mut Vec<u8>, shown: &HashMap<(u32, u32), [u32; 8]>, missing: bool) {
+        let cell = shown.values().map(|at| (at[0], at[1])).min();
+        let visible: HashSet<u32> = shown.keys().map(|k| k.0).collect();
+        let wanted: HashSet<&StripKey> = self.wanted.iter().collect();
+        let mut hide: HashMap<u32, (u32, u32)> = HashMap::new();
+        let mut more = false;
+        if let Some(cell) = cell {
+            let now = Instant::now();
+            let step = !missing && now >= self.warm_from();
+            let mut spent = Duration::ZERO;
+            for key in self.wanted.iter().chain(self.strips.keys()) {
+                let Some(&St::Shown { id, mem, wire, .. }) = self.strips.get(key) else {
+                    continue;
+                };
+                if visible.contains(&id) || hide.contains_key(&id) {
+                    continue;
+                }
+                if self.on_host.contains(&id) {
+                    hide.insert(id, cell);
+                } else if !wanted.contains(key) {
+                    // On its way out: not worth sending.
+                } else if step && spent < WARM_STEP {
+                    spent += send_time(mem, wire);
+                    hide.insert(id, cell);
+                } else {
+                    more = true;
+                }
+            }
+            if !spent.is_zero() {
+                debug_log!("warm {:.0} ms", spent.as_secs_f64() * 1e3);
+                self.charge(spent);
+            }
+        }
+        for &id in self.hidden.keys() {
+            if !hide.contains_key(&id) && self.by_id.contains_key(&id) {
+                encode::unplace(out, id, HIDDEN_P);
+            }
+        }
+        for (&id, &(row, col)) in &hide {
+            if self.hidden.get(&id) != Some(&(row, col)) {
+                encode::place_hidden(out, id, HIDDEN_P, row, col);
+            }
+        }
+        // What is not placed at all herdr may drop from the terminal.
+        self.on_host = visible.iter().chain(hide.keys()).copied().collect();
+        self.hidden = hide;
+        self.warm_more = more;
+    }
+
     fn frame(&mut self, vis: &[Visible], shown: &[ThumbAt]) {
         self.tick += 1;
         let mut out = Vec::with_capacity(4096);
@@ -1747,9 +1920,13 @@ impl App {
         if self.clear {
             out.extend_from_slice(b"\x1b_Ga=d,d=a,q=2\x1b\\\x1b[2J");
             self.clear = false;
+            self.hidden.clear();
+            self.on_host.clear();
         }
         for id in self.to_free.drain(..) {
             encode::free(&mut out, id);
+            self.hidden.remove(&id);
+            self.on_host.remove(&id);
         }
         if self.erase.is_some() {
             self.side_drawn.clear(); // the popup was over it, maybe
@@ -1849,6 +2026,23 @@ impl App {
                 encode::place(&mut out, id, p, at);
             }
         }
+        if self.herdr {
+            // Images newly on screen take the link first.
+            let fresh: HashSet<u32> = now
+                .keys()
+                .map(|k| k.0)
+                .filter(|id| !self.on_host.contains(id))
+                .collect();
+            let time = fresh
+                .iter()
+                .filter_map(|id| match self.by_id.get(id).and_then(|k| self.strips.get(k)) {
+                    Some(&St::Shown { mem, wire, .. }) => Some(send_time(mem, wire)),
+                    _ => None,
+                })
+                .sum();
+            self.charge(time);
+            self.hide(&mut out, &now, missing);
+        }
         if let Some((rect, scroll)) = popup {
             self.draw_help(&mut out, rect, scroll);
         }
@@ -1861,6 +2055,7 @@ impl App {
             debug_log!("frame {} missing={} {}", self.tick, u8::from(missing), list.join(" "));
         }
         self.placed = now;
+        self.missing = missing;
         if !missing {
             if let Some(t) = self.key_at.take() {
                 debug_log!("screen complete {:.1} ms after key", t.elapsed().as_secs_f64() * 1e3);
@@ -1960,4 +2155,19 @@ fn help_width() -> usize {
 /// Cell size from the window's pixel size, when the terminal reports one.
 fn cell_from(s: term::Size) -> Option<(u32, u32)> {
     (s.px_w > 0 && s.px_h > 0 && s.cols > 0 && s.rows > 0).then(|| (s.px_w / s.cols, s.px_h / s.rows))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spots() {
+        assert_eq!(spot("12"), Some((11, None)));
+        assert_eq!(spot("0"), Some((0, None)));
+        assert_eq!(spot("3:340.5"), Some((2, Some(340.5))));
+        assert_eq!(spot("3:"), None);
+        assert_eq!(spot("3:nan"), None);
+        assert_eq!(spot("q"), None);
+    }
 }

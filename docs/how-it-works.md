@@ -40,10 +40,11 @@ it refused or lost is sent again rather than left blank.
 ## Rendering runs ahead, output never blocks input
 
 The worker renders the visible strips first, then the rest of the page, the next
-two pages and the previous one. A writer thread owns the terminal: small frames
-(placements, the status line) jump ahead of queued uploads, and uploads no longer
-needed are dropped before they are sent. The key list popup is drawn as text in
-a hole cut out of the page images, so opening it sends no images.
+page, the previous one and the one after next. A writer thread owns the
+terminal: small frames (placements, the status line) jump ahead of queued
+uploads, and uploads no longer needed are dropped before they are sent. The key
+list popup is drawn as text in a hole cut out of the page images, so opening it
+sends no images.
 
 ## Where the time goes
 
@@ -114,6 +115,19 @@ change that, but SSH compression can: rendered text compresses 30-50x. On a
 simulated 9 MB/s, 50 ms link with a half-width pane, a page turn took 4.1-4.5 s
 without compression and 1.1-1.5 s with it (88.9 MB vs 3.1 MB on the link).
 
+herdr sends an image on only once it is visible, and once sent, moving it
+costs nothing. So in herdr farleaf places every image it holds: those not on
+screen one cell big, under a page image, where they cannot be seen. herdr then
+sends the next and previous pages ahead of need. What herdr sends queues ahead
+of the next key's images, and herdr reads no keys while its output waits, so
+farleaf paces it: it counts how long herdr should take for what it has sent
+(25 MB/s of raw pixels, half what herdr over SSH managed end to end), waits for
+that and for 150 ms after the last key, and sends 100 ms of it at a time. On
+the simulated link a page turn went from 0.24 to 0.06 s in half a MacBook's
+screen and from 0.45 to 0.10 s in half a 5K display, for 1.5-2 times as much on
+the link. A whole 5K display gains nothing: one page there is more than herdr's
+memory leaves room for.
+
 ## Measured
 
 `cargo dev stress` checks after every step that the screen shows exactly what
@@ -125,12 +139,13 @@ with 50 ms round trips and compression, so 0.05 s is its floor):
 |---|---|---|---|
 | Ghostty, same machine: half / whole 5K display | 0.00 / 0.01 | 0.02 / 0.02 | 0.00 / 0.01 |
 | Ghostty over SSH: half a MacBook / whole 5K display | 0.05 / 0.13 | 0.10 / 0.12 | 0.05 |
-| herdr, same machine, half 5K display | 0.09 | 0.07 | 0.01 |
-| herdr over SSH, half a MacBook | 0.23 | 0.26 | 0.07 |
+| herdr, same machine, half a MacBook | 0.01 | 0.05 | 0.01 |
+| herdr over SSH, half a MacBook / half 5K display | 0.06 / 0.10 | 0.25 / 0.41 | 0.06 |
 
-A next page is usually prefetched, so it only moves images. In herdr over SSH
-the time grows with the pane's pixels because herdr re-sends each new image
-raw; farleaf's own part is a few tens of milliseconds. For a scanned paper on a
+A next page is usually prefetched, so it only moves images (in herdr too, once
+herdr has sent it ahead). A jump in herdr over SSH grows with the pane's pixels
+because herdr re-sends each new image raw; farleaf's own part is a few tens of
+milliseconds. For a scanned paper on a
 whole 5K display, a jump takes 0.02-0.03 s and a resize 0.02 s (0.07 each with
 pdfium); over SSH, where the scan's slightly larger PNGs count, a jump takes
 0.18 s (0.14 with pdfium).

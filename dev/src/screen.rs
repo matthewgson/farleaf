@@ -142,9 +142,11 @@ pub struct Term {
     apc: Option<Vec<u8>>,
     gen: u64,
     pub mem: usize,
-    /// Bumped whenever what the screen shows may have changed.
+    /// Bumped whenever what the screen shows changed (see `feed`).
     pub version: u64,
-    grid_hash: u64,
+    view: u64,
+    /// Inside a synchronized update (mode 2026).
+    sync: bool,
     /// Whether text changes count as screen changes (not under herdr, which
     /// redraws its own text now and then).
     pub text_counts: bool,
@@ -174,7 +176,8 @@ impl Term {
             gen: 0,
             mem: 0,
             version: 0,
-            grid_hash: 0,
+            view: 0,
+            sync: false,
             text_counts: true,
         }
     }
@@ -257,8 +260,8 @@ impl Term {
                 }
                 let p = num(&kv, "p") as u32;
                 let (row, col) = self.cur;
+                self.reply(&kv, "OK");
                 self.places.insert((i, p), Place { row, col, kv });
-                self.version += 1;
             }
             "d" => {
                 self.stats.deletes += 1;
@@ -276,6 +279,15 @@ impl Term {
                         self.unplace(|k| k.0 == i && (p == 0 || k.1 == p));
                         if d == "I" && p == 0 {
                             self.drop_images(&[i]);
+                        }
+                    }
+                    // Images with ids from x to y.
+                    "r" | "R" => {
+                        let (lo, hi) = (num(&kv, "x") as u32, num(&kv, "y") as u32);
+                        self.unplace(|k| (lo..=hi).contains(&k.0));
+                        if d == "R" {
+                            let ids: Vec<u32> = self.images.keys().copied().filter(|i| (lo..=hi).contains(i)).collect();
+                            self.drop_images(&ids);
                         }
                     }
                     _ => {}
@@ -338,17 +350,27 @@ impl Term {
         );
         self.mem += mem;
         self.stats.peak_mem = self.stats.peak_mem.max(self.mem);
+        // a=T: transmit and place at the cursor (farleaf sends a=t, then a=p).
+        if get(&reply_kv, "a") == Some("T") {
+            self.stats.places += 1;
+            let (row, col) = self.cur;
+            let p = num(&reply_kv, "p") as u32;
+            self.places.insert(
+                (i, p),
+                Place {
+                    row,
+                    col,
+                    kv: reply_kv.clone(),
+                },
+            );
+        }
         // An image arriving changes nothing on screen until it is placed.
         self.reply(&reply_kv, "OK");
     }
 
-    /// Removes the placements `which` selects; a change to the screen if any.
+    /// Removes the placements `which` selects.
     fn unplace(&mut self, which: impl Fn(&(u32, u32)) -> bool) {
-        let before = self.places.len();
         self.places.retain(|k, _| !which(k));
-        if self.places.len() != before {
-            self.version += 1;
-        }
     }
 
     /// Ghostty's policy: unplaced images first, then placed ones, oldest first.
@@ -374,11 +396,26 @@ impl Term {
         }
     }
 
-    /// What is on screen, one entry per placement.
+    /// What is on screen, one entry per placement. A placement below the
+    /// text (z < 0) that an image above it covers entirely cannot be seen
+    /// (farleaf's warm-up placements under herdr) and is left out.
     pub fn shown(&mut self) -> Vec<Shown> {
-        let mut out = Vec::new();
+        let seen = self.visible();
+        seen.into_iter()
+            .filter_map(|(i, s)| {
+                let img = self.images.get_mut(&i)?;
+                Some([img.checksum() as i64, s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
+            })
+            .collect()
+    }
+
+    /// The placements that can be seen, as (image, [row, col, cols, rows,
+    /// x, y, w, h]): all but those below the text that an image above
+    /// covers.
+    fn visible(&self) -> Vec<(u32, [i64; 8])> {
+        let mut all = Vec::new();
         for ((i, _), pl) in &self.places {
-            let Some(img) = self.images.get_mut(i) else { continue };
+            let Some(img) = self.images.get(i) else { continue };
             let (sx, sy) = (num(&pl.kv, "x"), num(&pl.kv, "y"));
             let sw = Some(num(&pl.kv, "w")).filter(|&v| v != 0).unwrap_or(img.w as i64 - sx);
             let sh = Some(num(&pl.kv, "h")).filter(|&v| v != 0).unwrap_or(img.h as i64 - sy);
@@ -388,9 +425,29 @@ impl Term {
             let r = Some(num(&pl.kv, "r"))
                 .filter(|&v| v != 0)
                 .unwrap_or((sh + self.ch as i64 - 1) / self.ch as i64);
-            out.push([img.checksum() as i64, pl.row, pl.col, c, r, sx, sy, sw, sh]);
+            all.push((num(&pl.kv, "z"), *i, [pl.row, pl.col, c, r, sx, sy, sw, sh]));
         }
-        out
+        let covers = |a: &[i64; 8], b: &[i64; 8]| {
+            a[0] <= b[0] && a[1] <= b[1] && a[0] + a[3] >= b[0] + b[3] && a[1] + a[2] >= b[1] + b[2]
+        };
+        all.iter()
+            .filter(|(z, _, s)| *z >= 0 || !all.iter().any(|(z2, _, o)| *z2 >= 0 && covers(o, s)))
+            .map(|&(_, i, s)| (i, s))
+            .collect()
+    }
+
+    /// What the screen shows, as a hash: the images that can be seen, where
+    /// (and which transmission of each), and the text if it counts.
+    fn view_hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for (i, s) in self.visible() {
+            (i, self.images.get(&i).map(|img| img.gen), s).hash(&mut h);
+        }
+        if self.text_counts {
+            self.grid.hash(&mut h);
+        }
+        h.finish()
     }
 
     /// The screen as packed RGB: the text (if a font is given), then the
@@ -406,7 +463,11 @@ impl Term {
                 }
             }
         }
-        for ((i, _), pl) in &self.places {
+        // Lower z first, so what is above covers it.
+        let mut order: Vec<(i64, (u32, u32))> = self.places.iter().map(|(k, pl)| (num(&pl.kv, "z"), *k)).collect();
+        order.sort_unstable();
+        for (_, k) in order {
+            let (i, pl) = (&k.0, &self.places[&k]);
             let Some(img) = self.images.get_mut(i) else { continue };
             let (iw, ih) = (img.w as i64, img.h as i64);
             let rgb = img.decoded();
@@ -453,16 +514,14 @@ impl Term {
     /// sequence cut off by the end of `data`), to be given again with more.
     pub fn feed(&mut self, data: &[u8]) -> Vec<u8> {
         let rest = self.feed_some(data);
-        if !self.text_counts {
-            return rest;
-        }
-        // Text that looks the same after being redrawn is no change.
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        std::hash::Hash::hash(&self.grid, &mut h);
-        let h = std::hash::Hasher::finish(&h);
-        if h != self.grid_hash {
-            self.grid_hash = h;
-            self.version += 1;
+        // What looks the same after being redrawn or placed again is no
+        // change, and inside a synchronized update nothing is shown yet.
+        if !self.sync {
+            let h = self.view_hash();
+            if h != self.view {
+                self.view = h;
+                self.version += 1;
+            }
         }
         rest
     }
@@ -595,7 +654,17 @@ impl Term {
                     .push(format!("\x1bP>|{}\x1b\\", self.xtversion).into_bytes());
             }
             'c' if !params.starts_with('>') => self.replies.push(b"\x1b[?62;22c".to_vec()),
-            'h' if params == "?2026" => self.stats.frames += 1,
+            // Status and cursor reports: other viewers (bookokrat) wait for
+            // them at startup, as every real terminal answers.
+            'n' if params == "5" => self.replies.push(b"\x1b[0n".to_vec()),
+            'n' if params == "6" => self
+                .replies
+                .push(format!("\x1b[{};{}R", self.cur.0 + 1, self.cur.1 + 1).into_bytes()),
+            'h' if params == "?2026" => {
+                self.stats.frames += 1;
+                self.sync = true;
+            }
+            'l' if params == "?2026" => self.sync = false,
             'm' if !params.starts_with(['?', '>']) => {
                 self.attr = sgr(self.attr, if nums.is_empty() { &[0] } else { &nums });
             }
@@ -795,5 +864,21 @@ mod tests {
         assert!(t.grid[1][3].attr.bold);
         assert_eq!(t.shown().len(), 1);
         assert!(t.replies.is_empty()); // q=1: no reply on success
+    }
+
+    #[test]
+    fn only_what_can_be_seen_changes_the_screen() {
+        let mut t = Term::new(10, 3, 2, 4, false, 1 << 20, "ghostty 1.3.1");
+        let img = |i| format!("\x1b_Ga=t,f=24,s=2,v=1,i={i},q=1;AAAAAAAA\x1b\\");
+        t.feed(format!("{}{}\x1b[1;1H\x1b_Ga=p,i=5,p=1,c=4,r=2,q=1\x1b\\", img(5), img(6)).as_bytes());
+        let v = t.version;
+        // Placed again as it was, and another image hidden under it.
+        t.feed(b"\x1b[1;1H\x1b_Ga=p,i=5,p=1,c=4,r=2,q=1\x1b\\\x1b_Ga=p,i=6,p=9,c=1,r=1,z=-1,q=1\x1b\\");
+        assert_eq!((t.version, t.shown().len()), (v, 1));
+        // Nothing shows until a synchronized update ends; then image 6 does.
+        t.feed(b"\x1b[?2026h\x1b_Ga=d,d=i,i=5,p=1,q=2\x1b\\");
+        assert_eq!(t.version, v);
+        t.feed(b"\x1b[?2026l");
+        assert_eq!((t.version, t.shown().len()), (v + 1, 1));
     }
 }
