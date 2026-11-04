@@ -329,9 +329,21 @@ fn csi(b: &[u8]) -> Parsed {
         let Some(&[cb, cx, cy]) = b.get(end + 1..end + 4) else {
             return Parsed::Incomplete;
         };
-        let (button, col, row) = (cb.saturating_sub(32) as u32, cx.saturating_sub(32) as u32, cy.saturating_sub(32) as u32);
+        let (button, col, row) = (
+            cb.saturating_sub(32) as u32,
+            cx.saturating_sub(32) as u32,
+            cy.saturating_sub(32) as u32,
+        );
         let press = button & 3 != 3 || button >= 64;
-        return Parsed::Done(end + 4, Some(Input::Mouse { button, col, row, press }));
+        return Parsed::Done(
+            end + 4,
+            Some(Input::Mouse {
+                button,
+                col,
+                row,
+                press,
+            }),
+        );
     }
     let nums: Vec<u32> = params
         .split(|&c| c == b';')
@@ -442,7 +454,12 @@ mod tests {
 
     #[test]
     fn mouse() {
-        let m = |button, col, row, press| Input::Mouse { button, col, row, press };
+        let m = |button, col, row, press| Input::Mouse {
+            button,
+            col,
+            row,
+            press,
+        };
         assert_eq!(
             all(b"\x1b[<16;22;9M\x1b[<16;22;9m\x1b[<65;140;3Mj\x1b[M\x22\x31\x2b\x1b[M\x23\x31\x2bk"),
             vec![

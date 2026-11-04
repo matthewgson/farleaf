@@ -136,7 +136,11 @@ fn open(cmd: &str, src: &Source) -> Result<(), String> {
         return Ok(());
     }
     let err = String::from_utf8_lossy(&out.stderr);
-    let why = err.lines().map(str::trim).find(|l| !l.is_empty()).map_or_else(|| out.status.to_string(), str::to_string);
+    let why = err
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map_or_else(|| out.status.to_string(), str::to_string);
     Err(format!("{prog}: {why}"))
 }
 
@@ -277,7 +281,10 @@ mod tests {
                 column: 4
             })
         );
-        assert_eq!(parse_edit("This is SyncTeX command line utility\n", Path::new("/")), None);
+        assert_eq!(
+            parse_edit("This is SyncTeX command line utility\n", Path::new("/")),
+            None
+        );
         assert_eq!(parse_edit("Input:/a.tex\nLine:0\n", Path::new("/")), None);
     }
 }
