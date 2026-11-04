@@ -9,8 +9,9 @@ compiled in:
 | `src/layout.rs` | continuous page layout, fit modes, strips and tiles |
 | `src/worker.rs` | the render worker, the render and encode pool, the writer thread |
 | `src/encode.rs` | PNG, zlib and shared memory, Kitty commands |
-| `src/term.rs` | raw mode, input and reply parsing, signals |
+| `src/term.rs` | raw mode, input (keys, mouse) and reply parsing, signals |
 | `src/sidebar.rs` | the outline and thumbnail sidebar |
+| `src/synctex.rs` | inverse search: `synctex edit`, then the editor command |
 | `src/mupdf.rs`, `src/mupdf.c` | the engine: Rust side, and a C shim around the MuPDF calls used |
 | `build.rs` | builds MuPDF (from `vendor/`) with its makefile, and the shim |
 | `src/bench.rs` | `farleaf --bench`: where the time goes |

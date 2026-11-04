@@ -79,6 +79,8 @@ pub enum Event {
     },
     Sent(u32),
     WriteFailed(String),
+    /// Inverse search (see synctex.rs): the source line found, or what went wrong.
+    Synctex(Result<String, String>),
 }
 
 #[derive(Default)]
@@ -95,7 +97,7 @@ pub struct Worker {
     q: Shared,
 }
 
-fn send(tx: &Sender<Event>, wake: RawFd, e: Event) {
+pub fn send(tx: &Sender<Event>, wake: RawFd, e: Event) {
     let _ = tx.send(e);
     term::wake(wake, b'E');
 }

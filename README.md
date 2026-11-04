@@ -15,6 +15,8 @@ and inside [herdr](https://herdr.dev).
 - A sidebar with the outline (sections and subsections) or page thumbnails,
   as in macOS Preview: `o` or `t`, then `j` `k` to look around and Enter to go.
 - Reloads by itself when the file changes, for example after a LaTeX run.
+- SyncTeX both ways: an editor's forward search opens farleaf at the line, and
+  Ctrl-click (or `gd`) goes back to the source, in Neovim with VimTeX, say.
 
 ## Install
 
@@ -50,10 +52,6 @@ farleaf -p 12:340 paper.pdf  # ... with the spot 340 pt from its top a third of 
 farleaf docs/demo/demo.pdf   # the paper in the GIF, in a clone of this repo
 ```
 
-The `12:340` form is for editors: `synctex view` gives a source line's page
-and height, so a LaTeX editor's forward search can open farleaf there, or type
-`:12:340` and Enter into a farleaf that is already open.
-
 Press `?` for the list of keys. A count works before most keys: `5j`, `3l`, `12G`.
 
 | Keys | Action |
@@ -75,9 +73,57 @@ Press `?` for the list of keys. A count works before most keys: `5j`, `3l`, `12G
 | `t` | page thumbnails in a sidebar; again to hide them |
 | in the sidebar: `j` `k`, `Enter`, `Esc` | move (the page follows), stay there, go back to where you were |
 | `:12` `:12:340` `:q` `:noh` `:e` | go to page 12 (at 340 pt from its top), quit, clear highlights, reload |
+| `Ctrl`-click, `gd` | LaTeX: the source of the line clicked, or of the search match or the line a third of the way down (see below) |
 | `r` | reload |
 | `?`, `:help` | the key list |
 | `q`, `Ctrl-c` | quit |
+
+### LaTeX and SyncTeX
+
+Run LaTeX with `-synctex=1` (latexmk and VimTeX do) and farleaf goes both ways
+between the PDF and its source:
+
+- **Source to PDF.** `synctex view` gives a source line's page and height, so
+  an editor's forward search can open farleaf there (`farleaf -p 12:340
+  paper.pdf`) or type `:12:340` and Enter into a farleaf that is already open.
+  The line lands a third of the way down the screen.
+- **PDF to source.** Ctrl-click a line, or press `gd` for the current search
+  match or else the line a third of the way down (so `gd` right after a
+  forward search goes back to the same line). Right-click works as Ctrl-click,
+  except in herdr, which keeps right-click for its menu. farleaf runs
+  `synctex edit` (TeX Live's; TinyTeX: `tlmgr install synctex`) and then the
+  command in `FARLEAF_SYNCTEX_EDITOR`, with `{file}`, `{line}` and `{column}`
+  filled in. Without the variable, farleaf shows the source line in its
+  status line.
+
+Set the editor command once, in your shell's startup file, so every farleaf
+you start has it. For Neovim with [VimTeX](https://github.com/lervag/vimtex),
+whose `VimtexInverseSearch` finds the Neovim that has the project open and
+goes to the line there:
+
+```sh
+# zsh: ~/.zshrc   bash: ~/.bashrc
+export FARLEAF_SYNCTEX_EDITOR='nvim --headless -c "VimtexInverseSearch {line} {file}" -c "quitall!"'
+```
+
+```fish
+# fish: ~/.config/fish/config.fish
+set -gx FARLEAF_SYNCTEX_EDITOR 'nvim --headless -c "VimtexInverseSearch {line} {file}" -c "quitall!"'
+```
+
+Open a new shell (or `source` the file) for it to take effect. Other editors:
+
+| Editor | `FARLEAF_SYNCTEX_EDITOR` |
+|---|---|
+| Vim with VimTeX | `vim -v --not-a-term -T dumb -c "VimtexInverseSearch {line} {file}" -c "quitall!"` |
+| VS Code | `code --goto {file}:{line}:{column}` |
+| Emacs (server running) | `emacsclient --no-wait +{line}:{column} {file}` |
+
+The command is split into words as a shell would (quotes work) but runs
+without a shell and without the terminal, so a path with spaces in it stays
+one argument; for anything more, make it a script. farleaf turns on mouse
+reporting only for a PDF with SyncTeX data beside it (`paper.synctex.gz`);
+the wheel scrolls as before.
 
 ## Terminals
 

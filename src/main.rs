@@ -33,6 +33,7 @@ mod encode;
 mod layout;
 mod mupdf;
 mod sidebar;
+mod synctex;
 mod term;
 mod worker;
 
@@ -43,7 +44,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use term::{Input, Key, Parser, Tty};
@@ -60,7 +61,6 @@ const KEYS: &[(&str, &str)] = &[
     ("l h  J K", "next / previous page"),
     ("gg  G", "first page / end"),
     ("12G  12gg  :12", "page 12"),
-    (":12:340", "page 12, 340 pt from its top (SyncTeX)"),
     ("", "View"),
     ("z  Z", "fit page / fit width"),
     ("+  -", "zoom in / out"),
@@ -78,6 +78,10 @@ const KEYS: &[(&str, &str)] = &[
     ("o", "outline (contents); again to hide"),
     ("t", "page thumbnails; again to hide"),
     ("j k  Enter  Esc", "in the sidebar: move, go there, go back"),
+    ("", "LaTeX (SyncTeX)"),
+    (":12:340", "page 12, 340 pt from its top"),
+    ("Ctrl-click", "the source of the line clicked, in the editor"),
+    ("gd", "... of the match, or the line a third down"),
     ("", "Other"),
     ("r  :e", "reload (automatic when the file changes)"),
     ("?  :help", "this list"),
@@ -100,8 +104,15 @@ fn usage() -> String {
         }
     }
     s + &format!(
-        "\n{COUNT_NOTE}\n\nenvironment\n\
-         \x20 FARLEAF_TRANSPORT    force shm, png or zlib (default: probed)"
+        "\n{COUNT_NOTE} Right-click works as Ctrl-click (not in herdr, which\n\
+         keeps it for its menu). Clicks go to the source only when LaTeX wrote\n\
+         SyncTeX data (FILE.synctex.gz, from -synctex=1) beside the PDF.\n\n\
+         environment\n\
+         \x20 FARLEAF_TRANSPORT       force shm, png or zlib (default: probed)\n\
+         \x20 {}  the editor command for Ctrl-click and gd, with\n\
+         \x20                         {{file}} {{line}} {{column}}; with VimTeX in Neovim:\n\
+         \x20   nvim --headless -c \"VimtexInverseSearch {{line}} {{file}}\" -c \"quitall!\"",
+        synctex::EDITOR_VAR
     )
 }
 
@@ -303,11 +314,21 @@ fn run(path: PathBuf, start: Option<(usize, Option<f32>)>) -> Result<(), String>
         }
     };
     let out = tty.file.try_clone().map_err(|e| e.to_string())?;
-    let writer = Writer::spawn(out, tx, wake_w);
+    let writer = Writer::spawn(out, tx.clone(), wake_w);
     let mut app = App::new(
-        tty, wake_r, rx, worker, writer, transport, budget, path, sizes, probe.cell,
+        tty,
+        (wake_r, wake_w),
+        (tx, rx),
+        worker,
+        writer,
+        transport,
+        budget,
+        path,
+        sizes,
+        probe.cell,
     );
     app.herdr = herdr;
+    app.sync_mouse();
     if let Some((p, y)) = start {
         app.goto_spot(p, y, false);
     }
@@ -398,6 +419,14 @@ struct App {
     tty: Tty,
     wake_r: RawFd,
     rx: Receiver<Event>,
+    /// For threads of our own to report back (see synctex::inverse).
+    wake_w: RawFd,
+    tx: Sender<Event>,
+    /// Mouse reporting is on: the PDF has SyncTeX data.
+    mouse: bool,
+    /// The view's top after the last `:PAGE:Y`, and the spot it went to
+    /// (page, fraction of its height): `gd` goes back from there.
+    spot: Option<(u32, usize, f32)>,
     worker: Worker,
     writer: Option<Writer>,
     transport: Transport,
@@ -492,8 +521,8 @@ impl App {
     #[allow(clippy::too_many_arguments)]
     fn new(
         tty: Tty,
-        wake_r: RawFd,
-        rx: Receiver<Event>,
+        (wake_r, wake_w): (RawFd, RawFd),
+        (tx, rx): (Sender<Event>, Receiver<Event>),
         worker: Worker,
         writer: Writer,
         transport: Transport,
@@ -513,6 +542,10 @@ impl App {
             tty,
             wake_r,
             rx,
+            wake_w,
+            tx,
+            mouse: false,
+            spot: None,
             worker,
             writer: Some(writer),
             transport,
@@ -684,7 +717,120 @@ impl App {
                 }
             }
             Input::Graphics(id, Some(err)) => self.refused(id, &err),
+            Input::Mouse {
+                button,
+                col,
+                row,
+                press: true,
+            } => self.click(button, col, row),
             _ => {}
+        }
+    }
+
+    /// A mouse button pressed or the wheel turned (mouse reporting is on
+    /// only for PDFs with SyncTeX data). The wheel scrolls as the arrow keys
+    /// it stands for without mouse reporting; Ctrl-click and right-click go to
+    /// the source of the line under the mouse.
+    fn click(&mut self, button: u32, col: u32, row: u32) {
+        const SHIFT_ALT_CTRL: u32 = 4 | 8 | 16;
+        match button & !SHIFT_ALT_CTRL {
+            64 => return self.input(Input::Key(Key::Up)),
+            65 => return self.input(Input::Key(Key::Down)),
+            66 | 67 => {
+                // Sideways, only to pan: Left and Right turn pages too.
+                if self.pannable() && self.help.is_none() && self.prompt.is_none() {
+                    self.pan(if button & 1 == 0 { -1 } else { 1 });
+                }
+                return;
+            }
+            _ => {}
+        }
+        let ctrl_click = button & !SHIFT_ALT_CTRL == 0 && button & 16 != 0;
+        let right_click = button & !SHIFT_ALT_CTRL == 2;
+        if !(ctrl_click || right_click) || self.help.is_some() || self.prompt.is_some() {
+            return;
+        }
+        debug_log!("click {button} at {col},{row}");
+        match self.point_at(col.saturating_sub(1), row.saturating_sub(1)) {
+            Some((p, fx, fy)) => self.inverse(p, fx, fy),
+            None => self.say("not on a page"),
+        }
+    }
+
+    /// The point of a page under screen cell `col`, `row` (from 0), at the
+    /// cell's middle: the page, and fractions of its width and height.
+    fn point_at(&self, col: u32, row: u32) -> Option<(usize, f32, f32)> {
+        let g = self.geom();
+        let col = col.checked_sub(self.side_cols())?;
+        if row >= g.rows || col >= g.cols {
+            return None;
+        }
+        let at = self.top + row;
+        let p = self.layout.page_at(at);
+        let b = self.layout.pages[p];
+        if at < b.y || at >= b.y + b.rows {
+            return None; // the gap between pages
+        }
+        let page_col = match b.cols > g.cols {
+            true => col + self.layout.left_of(p, self.left),
+            false => col.checked_sub(b.x).filter(|&c| c < b.cols)?,
+        };
+        let (fx, fy) = self.layout.frac_at(p, page_col as f32 + 0.5, (at - b.y) as f32 + 0.5);
+        Some((p, fx, fy))
+    }
+
+    /// Where `gd` looks: the spot `:PAGE:Y` (an editor's forward search) went
+    /// to, if the view has not moved since; else the current search match,
+    /// if it is on screen; else the line a third of the way down the screen,
+    /// where `:PAGE:Y` puts its line unless the page cannot scroll that far.
+    /// Across, the middle of what shows of the page.
+    fn reading_spot(&self) -> (usize, f32, f32) {
+        let g = self.geom();
+        let mid = |p: usize| {
+            let b = self.layout.pages[p];
+            match b.cols > g.cols {
+                true => self.layout.left_of(p, self.left) as f32 + g.cols as f32 / 2.0,
+                false => b.cols as f32 / 2.0,
+            }
+        };
+        if let Some((top, p, fy)) = self.spot {
+            if top == self.top && p < self.layout.pages.len() {
+                return (p, self.layout.frac_at(p, mid(p), 0.0).0, fy);
+            }
+        }
+        if let Some((p, i)) = self.search.cur {
+            if let Some(&[r, ..]) = self.search.hits.get(&p).and_then(|v| v.get(i)).map(Vec::as_slice) {
+                let (fx, fy) = ((r[0] + r[2]) / 2.0, (r[1] + r[3]) / 2.0);
+                let row = self.layout.pages[p].y as f32 + self.layout.rows_down(p, fy);
+                if row >= self.top as f32 && row < (self.top + g.rows) as f32 {
+                    return (p, fx, fy);
+                }
+            }
+        }
+        let at = self.top + g.rows / 3;
+        let p = self.layout.page_at(at);
+        let b = self.layout.pages[p];
+        // Just above the third: forward search puts a line's baseline there.
+        let rows = (at.saturating_sub(b.y) as f32 - 0.25).max(0.0);
+        let (fx, fy) = self.layout.frac_at(p, mid(p), rows);
+        (p, fx, fy)
+    }
+
+    /// Inverse search from that point of page `p` (see synctex.rs).
+    fn inverse(&mut self, p: usize, fx: f32, fy: f32) {
+        let (w, h) = self.sizes[p];
+        synctex::inverse(self.path.clone(), p, fx * w, fy * h, self.tx.clone(), self.wake_w);
+    }
+
+    /// Mouse reporting on for a PDF with SyncTeX data, off otherwise (and
+    /// again after a reload: the data may have come or gone).
+    fn sync_mouse(&mut self) {
+        let want = synctex::data_file(&self.path).is_some();
+        if want != self.mouse {
+            self.mouse = want;
+            debug_log!("mouse reporting {}", if want { "on" } else { "off" });
+            let seq = if want { term::MOUSE_ON } else { term::MOUSE_OFF };
+            self.writer().frame(seq.to_vec());
         }
     }
 
@@ -760,6 +906,7 @@ impl App {
                     f.sel = 0;
                 }
                 self.relayout(true);
+                self.sync_mouse();
                 self.say("reloaded");
             }
             Event::Doc(Ok(_)) => self.say("reload: the PDF has no pages"),
@@ -781,6 +928,7 @@ impl App {
                 self.error = Some(format!("lost the terminal: {e}"));
                 self.quit = true;
             }
+            Event::Synctex(Ok(m) | Err(m)) => self.say(&m),
         }
     }
 
@@ -892,9 +1040,13 @@ impl App {
         }
         let p = p.min(self.layout.pages.len() - 1);
         let b = self.layout.pages[p];
-        let at = (y / self.sizes[p].1.max(1.0)).clamp(0.0, 1.0) * b.rows as f32;
+        let fy = (y / self.sizes[p].1.max(1.0)).clamp(0.0, 1.0);
+        let at = self.layout.rows_down(p, fy);
         self.top = (b.y as f32 + at - (self.geom().rows / 3) as f32).round().max(0.0) as u32;
         self.clamp();
+        // A point above the baseline, inside the line, for `gd`.
+        let above = ((y - 1.0) / self.sizes[p].1.max(1.0)).clamp(0.0, 1.0);
+        self.spot = Some((self.top, p, above));
     }
 
     fn page_step(&mut self, n: i64) {
@@ -948,6 +1100,7 @@ impl App {
     /// thumbnails of the same size, unless the content changed.
     fn relayout(&mut self, content_changed: bool) {
         let pos = self.pos();
+        let at_spot = self.spot.is_some_and(|s| s.0 == self.top);
         if content_changed {
             self.content_gen = self.content_gen.wrapping_add(1);
         }
@@ -987,6 +1140,9 @@ impl App {
             None => Thumbs::default(),
         };
         self.set_pos(pos);
+        if let Some(s) = self.spot.as_mut().filter(|_| at_spot) {
+            s.0 = self.top; // still where it went, if the view had not moved
+        }
         let max_left = self
             .layout
             .pages
@@ -1142,6 +1298,10 @@ impl App {
         let n = self.count.take();
         match (p, k) {
             ('g', Key::Char('g')) => self.goto_page(n.map_or(0, |n| n as usize - 1), true),
+            ('g', Key::Char('d')) => {
+                let (p, fx, fy) = self.reading_spot();
+                self.inverse(p, fx, fy);
+            }
             ('m', Key::Char(c)) if c.is_ascii_alphabetic() => {
                 self.marks.insert(c, self.pos());
                 self.say(&format!("mark {c}"));

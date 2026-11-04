@@ -14,8 +14,15 @@ pub struct Tty {
 /// What restore() needs, reachable from the panic hook and signal paths.
 static SAVED: OnceLock<(RawFd, libc::termios)> = OnceLock::new();
 
-/// Leaves the alternate screen with a clean slate. Safe to call twice.
-pub const LEAVE: &[u8] = b"\x1b_Ga=d,d=A,q=2\x1b\\\x1b[?2026l\x1b[0m\x1b[?25h\x1b[?1049l";
+/// Leaves the alternate screen with a clean slate (mouse reporting off
+/// too). Safe to call twice.
+pub const LEAVE: &[u8] = b"\x1b_Ga=d,d=A,q=2\x1b\\\x1b[?2026l\x1b[?1000l\x1b[?1006l\x1b[0m\x1b[?25h\x1b[?1049l";
+
+/// Mouse reporting: presses, releases and the wheel (1000), as SGR
+/// sequences (1006). Only for PDFs with SyncTeX data (Ctrl-click goes to the
+/// source); without it the terminal turns the wheel into arrow keys itself.
+pub const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1006h";
+pub const MOUSE_OFF: &[u8] = b"\x1b[?1000l\x1b[?1006l";
 
 impl Tty {
     pub fn open() -> io::Result<Tty> {
@@ -195,6 +202,15 @@ pub enum Input {
     CellSize(u32, u32),
     /// The reply to DA1, which every terminal sends: our "end of replies" marker.
     DeviceAttributes,
+    /// A mouse button pressed or released, or the wheel turned: the button
+    /// code as the terminal sends it (low bits the button, 4 shift, 8 alt,
+    /// 16 ctrl, 32 motion, 64 and up the wheel), and the cell, from 1.
+    Mouse {
+        button: u32,
+        col: u32,
+        row: u32,
+        press: bool,
+    },
 }
 
 #[derive(Default)]
@@ -306,6 +322,17 @@ fn csi(b: &[u8]) -> Parsed {
     let end = end + 2;
     let params = &b[2..end];
     let fin = b[end];
+    if fin == b'M' && params.is_empty() {
+        // The old X10 encoding, three bytes after the M, from a terminal
+        // that ignored our request for SGR: read it, or its bytes would
+        // come through as keys.
+        let Some(&[cb, cx, cy]) = b.get(end + 1..end + 4) else {
+            return Parsed::Incomplete;
+        };
+        let (button, col, row) = (cb.saturating_sub(32) as u32, cx.saturating_sub(32) as u32, cy.saturating_sub(32) as u32);
+        let press = button & 3 != 3 || button >= 64;
+        return Parsed::Done(end + 4, Some(Input::Mouse { button, col, row, press }));
+    }
     let nums: Vec<u32> = params
         .split(|&c| c == b';')
         .map(|p| {
@@ -329,6 +356,12 @@ fn csi(b: &[u8]) -> Parsed {
             Some(4) | Some(8) => k(Key::End),
             _ => None,
         },
+        b'M' | b'm' if params.first() == Some(&b'<') && nums.len() == 3 => Some(Input::Mouse {
+            button: nums[0],
+            col: nums[1],
+            row: nums[2],
+            press: fin == b'M',
+        }),
         b'c' if params.first() == Some(&b'?') => Some(Input::DeviceAttributes),
         b't' if nums.first() == Some(&6) && nums.len() >= 3 => Some(Input::CellSize(nums[2], nums[1])),
         _ => None,
@@ -405,6 +438,29 @@ mod tests {
                 Input::Key(Key::Char('q')),
             ]
         );
+    }
+
+    #[test]
+    fn mouse() {
+        let m = |button, col, row, press| Input::Mouse { button, col, row, press };
+        assert_eq!(
+            all(b"\x1b[<16;22;9M\x1b[<16;22;9m\x1b[<65;140;3Mj\x1b[M\x22\x31\x2b\x1b[M\x23\x31\x2bk"),
+            vec![
+                m(16, 22, 9, true),
+                m(16, 22, 9, false),
+                m(65, 140, 3, true),
+                Input::Key(Key::Char('j')),
+                m(2, 17, 11, true),
+                m(3, 17, 11, false),
+                Input::Key(Key::Char('k')),
+            ]
+        );
+        // An X10 report cut short waits for the rest.
+        let mut p = Parser::default();
+        p.feed(b"\x1b[M\x22");
+        assert_eq!(p.next(false), None);
+        p.feed(b"\x31\x2b");
+        assert_eq!(p.next(false), Some(m(2, 17, 11, true)));
     }
 
     #[test]

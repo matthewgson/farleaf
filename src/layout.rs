@@ -267,6 +267,23 @@ impl Layout {
         p.y + ((frac * p.rows as f32) as u32).min(p.rows.saturating_sub(1))
     }
 
+    /// Rows from the top of `page` down to the point `frac` of the way
+    /// down it, exactly (a page's last row may be partly blank).
+    pub fn rows_down(&self, page: usize, frac: f32) -> f32 {
+        let g = &self.geom;
+        frac * self.pages[page].px_h as f32 / (g.ch as f32 * g.scale)
+    }
+
+    /// The point `cols` columns across and `rows` rows down `page` (from
+    /// its top-left corner), as fractions of its width and height.
+    pub fn frac_at(&self, page: usize, cols: f32, rows: f32) -> (f32, f32) {
+        let (p, g) = (&self.pages[page], &self.geom);
+        (
+            (cols * g.cw as f32 * g.scale / p.px_w as f32).clamp(0.0, 1.0),
+            (rows * g.ch as f32 * g.scale / p.px_h as f32).clamp(0.0, 1.0),
+        )
+    }
+
     /// The page column of a point `frac` of the way across `page`.
     pub fn col_in(&self, page: usize, frac: f32) -> u32 {
         let p = &self.pages[page];
