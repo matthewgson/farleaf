@@ -13,6 +13,7 @@
 use crate::encode::{self, Payload, ShmBuf, Transport};
 use crate::mupdf::{Doc, Entry, Page};
 use crate::term;
+use crate::visual::Text;
 use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 use std::os::fd::RawFd;
@@ -49,6 +50,9 @@ pub struct StripJob {
     pub size_h: u32,
     pub invert: bool,
     pub marks: Arc<Vec<[f32; 4]>>,
+    /// Visual mode: the selected text's boxes, and the cursor's character.
+    pub selection: Arc<Vec<[f32; 4]>>,
+    pub cursor: Option<[f32; 4]>,
     pub transport: Transport,
     /// The color around the page, where the bitmap is bigger than it
     /// (thumbnails); white otherwise.
@@ -65,9 +69,13 @@ pub enum Job {
         backward: bool,
     },
     Reload,
+    /// The text of a page (for visual mode).
+    Text(usize),
 }
 
 pub enum Event {
+    /// The text of a page, empty if it has none.
+    Text(usize, Arc<Text>),
     /// The document opened (or reopened): its page sizes in points.
     Doc(Result<Vec<(f32, f32)>, String>),
     /// Its outline, read once the first screen is rendered.
@@ -211,6 +219,14 @@ fn render_loop(path: PathBuf, q: Shared, tx: Sender<Event>, wake: RawFd) {
                         (!found.is_empty()).then_some((i, found))
                     });
                 send(&tx, wake, Event::Found { seq, hit });
+            }
+            Work::Job(Job::Text(i)) => {
+                let cached = pages.iter().find(|(p, _)| *p as usize == i).map(|(_, l)| l.clone());
+                let text = cached
+                    .or_else(|| doc.page(i).map(Arc::new))
+                    .map(|page| page.text())
+                    .unwrap_or_default();
+                send(&tx, wake, Event::Text(i, Arc::new(text)));
             }
             Work::Strip(s) => {
                 rendered = true;
@@ -409,10 +425,18 @@ fn log_strip(s: &StripJob, render: Duration, encode: Duration, bytes: usize, rgb
 }
 
 /// Marks search hits like a highlighter pen: multiply by yellow, so white
-/// paper turns yellow and the ink stays dark.
+/// paper turns yellow and the ink stays dark. The visual selection is the
+/// same in light blue, and its cursor in orange.
 fn highlight(rgb: &mut [u8], s: &StripJob) {
+    tint(rgb, s, &s.marks, [255, 225, 40]);
+    tint(rgb, s, &s.selection, [175, 205, 255]);
+    tint(rgb, s, s.cursor.as_slice(), [255, 140, 50]);
+}
+
+/// Multiplies the pixels under the page-fraction boxes `rects` by `mul` / 255.
+fn tint(rgb: &mut [u8], s: &StripJob, rects: &[[f32; 4]], mul: [u16; 3]) {
     let (w, h) = (s.bw as i64, s.bh as i64);
-    for r in s.marks.iter() {
+    for r in rects {
         let x0 = ((r[0] * s.size_w as f32) as i64 + s.dx as i64 - 1).clamp(0, w);
         let x1 = ((r[2] * s.size_w as f32).ceil() as i64 + s.dx as i64 + 1).clamp(0, w);
         let y0 = ((r[1] * s.size_h as f32) as i64 + s.dy as i64 - 1).clamp(0, h);
@@ -420,8 +444,11 @@ fn highlight(rgb: &mut [u8], s: &StripJob) {
         for y in y0..y1 {
             for x in x0..x1 {
                 let i = ((y * w + x) * 3) as usize;
-                rgb[i + 2] = (rgb[i + 2] as u16 * 40 / 255) as u8;
-                rgb[i + 1] = (rgb[i + 1] as u16 * 225 / 255) as u8;
+                for (c, m) in mul.iter().enumerate() {
+                    if *m < 255 {
+                        rgb[i + c] = (rgb[i + c] as u16 * m / 255) as u8;
+                    }
+                }
             }
         }
     }

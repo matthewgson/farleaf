@@ -35,6 +35,8 @@ mod mupdf;
 mod sidebar;
 mod synctex;
 mod term;
+mod visual;
+mod vmode;
 mod worker;
 
 use encode::Transport;
@@ -78,6 +80,14 @@ const KEYS: &[(&str, &str)] = &[
     ("o", "outline (contents); again to hide"),
     ("t", "page thumbnails; again to hide"),
     ("j k  Enter  Esc", "in the sidebar: move, go there, go back"),
+    ("", "Visual mode (select text, copy)"),
+    ("v  V", "select by characters / lines; again to leave"),
+    ("h j k l  w b e  0 ^ $  { }", "move the cursor (counts work)"),
+    ("Ctrl-d Ctrl-u Ctrl-f Ctrl-b", "move the cursor a half / a whole screen"),
+    ("o", "the other end of the selection"),
+    ("y  Y", "copy to the system clipboard (also over SSH), leave"),
+    ("gd", "the source of the cursor's line, in the editor"),
+    ("Esc", "leave visual mode"),
     ("", "LaTeX (SyncTeX)"),
     (":12:340", "page 12, 340 pt from its top"),
     ("Ctrl-click", "the source of the line clicked, in the editor"),
@@ -482,6 +492,12 @@ struct App {
     pending: Option<char>,
     prompt: Option<(char, String)>,
     search: Search,
+    /// Visual mode (see vmode.rs): the selection, the page texts it works
+    /// on, the texts asked of the worker, and a `v` waiting for its page's text.
+    visual: Option<visual::Visual>,
+    texts: visual::Texts,
+    text_asked: HashSet<usize>,
+    entering: Option<vmode::Entering>,
     marks: HashMap<char, Pos>,
     jumps: Vec<Pos>,
     jump_at: usize,
@@ -603,6 +619,10 @@ impl App {
             pending: None,
             prompt: None,
             search: Search::default(),
+            visual: None,
+            texts: HashMap::new(),
+            text_asked: HashSet::new(),
+            entering: None,
             marks: HashMap::new(),
             jumps: Vec::new(),
             jump_at: 0,
@@ -783,8 +803,10 @@ impl App {
     /// to, if the view has not moved since; else the current search match,
     /// if it is on screen; else the line a third of the way down the screen,
     /// where `:PAGE:Y` puts its line unless the page cannot scroll that far.
-    /// Across, the middle of what shows of the page.
-    fn reading_spot(&self) -> (usize, f32, f32) {
+    /// Across, the middle of what shows of the page. The last is whether the
+    /// spot is a particular character (a match) or only a line (a forward
+    /// search, which gives no column, or a guess).
+    fn reading_spot(&self) -> (usize, f32, f32, bool) {
         let g = self.geom();
         let mid = |p: usize| {
             let b = self.layout.pages[p];
@@ -795,7 +817,7 @@ impl App {
         };
         if let Some((top, p, fy)) = self.spot {
             if top == self.top && p < self.layout.pages.len() {
-                return (p, self.layout.frac_at(p, mid(p), 0.0).0, fy);
+                return (p, self.layout.frac_at(p, mid(p), 0.0).0, fy, false);
             }
         }
         if let Some((p, i)) = self.search.cur {
@@ -803,7 +825,7 @@ impl App {
                 let (fx, fy) = ((r[0] + r[2]) / 2.0, (r[1] + r[3]) / 2.0);
                 let row = self.layout.pages[p].y as f32 + self.layout.rows_down(p, fy);
                 if row >= self.top as f32 && row < (self.top + g.rows) as f32 {
-                    return (p, fx, fy);
+                    return (p, fx, fy, true);
                 }
             }
         }
@@ -813,7 +835,7 @@ impl App {
         // Just above the third: forward search puts a line's baseline there.
         let rows = (at.saturating_sub(b.y) as f32 - 0.25).max(0.0);
         let (fx, fy) = self.layout.frac_at(p, mid(p), rows);
-        (p, fx, fy)
+        (p, fx, fy, false)
     }
 
     /// Inverse search from that point of page `p` (see synctex.rs).
@@ -902,6 +924,7 @@ impl App {
                 self.page_ver = vec![0; self.sizes.len()];
                 self.search.hits.clear();
                 self.search.cur = None;
+                self.visual_reset();
                 if let Some(f) = self.side.as_mut().and_then(|s| s.focus.as_mut()) {
                     f.sel = 0;
                 }
@@ -924,6 +947,7 @@ impl App {
             }
             Event::Doc(Err(e)) => self.say(&format!("reload failed: {e}")),
             Event::Found { seq, hit } => self.found(seq, hit),
+            Event::Text(page, text) => self.visual_text(page, text),
             Event::WriteFailed(e) => {
                 self.error = Some(format!("lost the terminal: {e}"));
                 self.quit = true;
@@ -1211,6 +1235,9 @@ impl App {
         if self.side.as_ref().is_some_and(|s| s.focus.is_some()) {
             return self.side_key(k, n);
         }
+        if self.visual.is_some() && self.visual_key(k, n) {
+            return;
+        }
         let n1 = n.unwrap_or(1) as i64;
         let rows = self.geom().rows as i64;
         let line = (rows / 12).max(2);
@@ -1250,6 +1277,8 @@ impl App {
                 self.invert = !self.invert;
                 self.relayout(true);
             }
+            Key::Char('v') => self.visual_enter(false),
+            Key::Char('V') => self.visual_enter(true),
             Key::Char('o') => self.side_open(Kind::Outline),
             Key::Char('t') => self.side_open(Kind::Thumbs),
             Key::Char('r') => {
@@ -1296,10 +1325,16 @@ impl App {
 
     fn pending_key(&mut self, p: char, k: Key) {
         let n = self.count.take();
+        if self.visual.is_some() {
+            if (p, k) == ('g', Key::Char('d')) {
+                self.visual_inverse();
+            }
+            return;
+        }
         match (p, k) {
             ('g', Key::Char('g')) => self.goto_page(n.map_or(0, |n| n as usize - 1), true),
             ('g', Key::Char('d')) => {
-                let (p, fx, fy) = self.reading_spot();
+                let (p, fx, fy, _) = self.reading_spot();
                 self.inverse(p, fx, fy);
             }
             ('m', Key::Char(c)) if c.is_ascii_alphabetic() => {
@@ -1779,6 +1814,7 @@ impl App {
             count,
             p + 1
         ));
+        self.visual_follow(p, r[0] + 0.002, (r[1] + r[3]) / 2.0);
     }
 
     fn clear_highlights(&mut self) {
@@ -1899,6 +1935,8 @@ impl App {
                 size_h: sh,
                 invert: self.invert,
                 marks: Arc::new(Vec::new()),
+                selection: Arc::new(Vec::new()),
+                cursor: None,
                 transport: self.transport,
                 bg: Some(sidebar::BG),
             };
@@ -1911,6 +1949,7 @@ impl App {
             .get(&(key.page as usize))
             .map(|m| m.iter().flatten().copied().collect())
             .unwrap_or_default();
+        let (selection, cursor) = self.visual_paint(key.page as usize);
         StripJob {
             key,
             id,
@@ -1922,6 +1961,8 @@ impl App {
             size_h: b.px_h,
             invert: self.invert,
             marks: Arc::new(marks),
+            selection: Arc::new(selection),
+            cursor,
             transport: self.transport,
             bg: None,
         }
@@ -2266,7 +2307,10 @@ impl App {
                 Kind::Outline => "contents: j k to move, Enter to go, Esc to go back, o to hide",
                 Kind::Thumbs => "pages: j k to move, Enter to go, Esc to go back, t to hide",
             }),
-            _ => None,
+            _ => self.visual.as_ref().map(|v| match v.line {
+                true => "-- VISUAL LINE --   y copy  gd source  o other end  Esc",
+                false => "-- VISUAL --   y copy  gd source  o other end  Esc",
+            }),
         };
         let left = match (&self.msg, hint) {
             (Some((m, _)), _) => m.as_str(),

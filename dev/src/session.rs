@@ -550,6 +550,9 @@ pub fn snapshot(term: &mut Term, text: &mut Option<Text>, path: &Path) {
     let (w, h, fb) = term.render(text.as_mut());
     let _ = std::fs::write(path, crate::png::encode(w, h, &fb));
     let _ = std::fs::write(path.with_extension("txt"), term.lines().join("\n") + "\n");
+    if let Some(c) = term.clipboard.last() {
+        let _ = std::fs::write(path.with_extension("clip"), c);
+    }
 }
 
 /// Does `step`; returns the keys to type, if it is a key step.

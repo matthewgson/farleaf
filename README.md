@@ -74,9 +74,25 @@ Press `?` for the list of keys. A count works before most keys: `5j`, `3l`, `12G
 | in the sidebar: `j` `k`, `Enter`, `Esc` | move (the page follows), stay there, go back to where you were |
 | `:12` `:12:340` `:q` `:noh` `:e` | go to page 12 (at 340 pt from its top), quit, clear highlights, reload |
 | `Ctrl`-click, `gd` | LaTeX: the source of the line clicked, or of the search match or the line a third of the way down (see below) |
+| `v` `V` | visual mode: select text by characters / lines, `y` copies, `gd` goes to the source (see below) |
 | `r` | reload |
 | `?`, `:help` | the key list |
 | `q`, `Ctrl-c` | quit |
+
+### Visual mode
+
+`v` puts a cursor on the text (at the search match or SyncTeX spot if there is
+one, else the line a third of the way down); `V` selects whole lines. Move
+with `h j k l`, `w b e`, `0 ^ $`, `{ }`, `Ctrl-d/u/f/b`, with counts; `o`
+swaps the ends, `n`/`N` follow search matches, `Esc` leaves.
+
+- `y` copies to the system clipboard, as in LazyVim, and leaves. It uses
+  OSC 52, the way Neovim does over SSH, so it reaches the clipboard of the
+  machine you sit at (Ghostty, through herdr and SSH) with nothing installed
+  on the remote side. By characters, the lines of a paragraph run together
+  and a word broken by a hyphen is mended; `Y` or `V` copies lines as they are.
+- `gd` goes to the source line of the cursor's character (SyncTeX, set up
+  below), and stays in visual mode.
 
 ### LaTeX and SyncTeX
 

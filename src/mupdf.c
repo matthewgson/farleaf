@@ -8,6 +8,7 @@
 
 #include <mupdf/fitz.h>
 #include <mupdf/pdf.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
@@ -237,6 +238,43 @@ void fl_outline(fz_context *ctx, fz_document *doc, fl_outline_fn *fn, void *user
 	}
 	fz_always(ctx)
 		fz_drop_outline(ctx, o);
+	fz_catch(ctx) {
+	}
+}
+
+typedef void (fl_text_fn)(void *user, int c, int flags, float x0, float y0, float x1, float y1);
+
+/* The page's text, a character at a time in MuPDF's reading order, through
+ * `fn`: the character, flags (1: first of a line, 2: first of a block) and
+ * its box in points from the page's top-left. Capped at 400000 characters. */
+void fl_text(fz_context *ctx, fz_display_list *list, fl_text_fn *fn, void *user) {
+	fz_stext_page *text = NULL;
+	fz_var(text);
+	fz_try(ctx) {
+		fz_rect b = fz_bound_display_list(ctx, list);
+		text = fz_new_stext_page_from_display_list(ctx, list, NULL);
+		int left = 400000;
+		for (fz_stext_block *blk = text->first_block; blk; blk = blk->next) {
+			if (blk->type != FZ_STEXT_BLOCK_TEXT)
+				continue;
+			int first_line = 1;
+			for (fz_stext_line *ln = blk->u.t.first_line; ln; ln = ln->next) {
+				int flags = first_line ? 3 : 1;
+				first_line = 0;
+				for (fz_stext_char *ch = ln->first_char; ch && left > 0; ch = ch->next, left--) {
+					fz_quad q = ch->quad;
+					float x0 = fminf(fminf(q.ul.x, q.ur.x), fminf(q.ll.x, q.lr.x));
+					float x1 = fmaxf(fmaxf(q.ul.x, q.ur.x), fmaxf(q.ll.x, q.lr.x));
+					float y0 = fminf(fminf(q.ul.y, q.ur.y), fminf(q.ll.y, q.lr.y));
+					float y1 = fmaxf(fmaxf(q.ul.y, q.ur.y), fmaxf(q.ll.y, q.lr.y));
+					fn(user, ch->c, flags, x0 - b.x0, y0 - b.y0, x1 - b.x0, y1 - b.y0);
+					flags = 0;
+				}
+			}
+		}
+	}
+	fz_always(ctx)
+		fz_drop_stext_page(ctx, text);
 	fz_catch(ctx) {
 	}
 }

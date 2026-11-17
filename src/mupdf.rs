@@ -6,6 +6,7 @@
 //! its pages is interpreted once into a display list, which any number of
 //! threads can then render at once: that is how strips render in parallel.
 
+use crate::visual::{Ch, Text};
 use std::cell::Cell;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::sync::{Arc, OnceLock};
@@ -24,6 +25,7 @@ struct FzList {
 }
 
 type OutlineFn = extern "C" fn(*mut c_void, *const c_char, c_int, c_int, f32, f32);
+type TextFn = extern "C" fn(*mut c_void, c_int, c_int, f32, f32, f32, f32);
 
 extern "C" {
     fn fl_new_context() -> *mut Ctx;
@@ -57,6 +59,7 @@ extern "C" {
         max: c_int,
     ) -> c_int;
     fn fl_outline(ctx: *mut Ctx, doc: *mut FzDoc, f: OutlineFn, user: *mut c_void);
+    fn fl_text(ctx: *mut Ctx, list: *mut FzList, f: TextFn, user: *mut c_void);
     fn fl_empty_store(ctx: *mut Ctx);
 }
 
@@ -250,6 +253,26 @@ impl Page {
                 dy as f32,
             )
         };
+    }
+
+    /// The page's characters in reading order, for visual mode.
+    pub fn text(&self) -> Text {
+        extern "C" fn add(user: *mut c_void, c: c_int, flags: c_int, x0: f32, y0: f32, x1: f32, y1: f32) {
+            let out = unsafe { &mut *(user as *mut Vec<(char, u8, [f32; 4])>) };
+            out.push((char::from_u32(c as u32).unwrap_or(' '), flags as u8, [x0, y0, x1, y1]));
+        }
+        let mut raw: Vec<(char, u8, [f32; 4])> = Vec::new();
+        unsafe { fl_text(ctx(), self.list, add, (&mut raw as *mut Vec<_>).cast()) };
+        let (w, h) = (self.w, self.h);
+        Text::new(
+            raw.into_iter()
+                .map(|(c, flags, r)| Ch {
+                    c,
+                    flags,
+                    r: [r[0] / w, r[1] / h, r[2] / w, r[3] / h],
+                })
+                .collect(),
+        )
     }
 
     /// Every match of `needle` on this page, each as one or more rectangles

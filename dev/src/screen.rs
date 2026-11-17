@@ -139,6 +139,8 @@ pub struct Term {
     attr: Attr,
     pub stats: Stats,
     pub replies: Vec<Vec<u8>>,
+    /// What the program copied with OSC 52, oldest first.
+    pub clipboard: Vec<String>,
     apc: Option<Vec<u8>>,
     gen: u64,
     pub mem: usize,
@@ -172,6 +174,7 @@ impl Term {
             attr: Attr::default(),
             stats: Stats::default(),
             replies: Vec::new(),
+            clipboard: Vec::new(),
             apc: None,
             gen: 0,
             mem: 0,
@@ -581,6 +584,24 @@ impl Term {
                             self.csi(&params, data[k] as char);
                         }
                         i = k + 1;
+                    }
+                    b']' => {
+                        // OSC, ended by BEL or ST. OSC 52 is a clipboard write.
+                        let end = data[i..].iter().enumerate().find_map(|(k, &b)| match b {
+                            0x07 => Some((k, 1)),
+                            0x1b if data.get(i + k + 1) == Some(&b'\\') => Some((k, 2)),
+                            _ => None,
+                        });
+                        let Some((k, term_len)) = end else {
+                            return data[i..].to_vec();
+                        };
+                        let body = String::from_utf8_lossy(&data[i + 2..i + k]).into_owned();
+                        if let Some(rest) = body.strip_prefix("52;") {
+                            let b64 = rest.split_once(';').map_or(rest, |x| x.1);
+                            let text = String::from_utf8_lossy(&base64_decode(b64.as_bytes())).into_owned();
+                            self.clipboard.push(text);
+                        }
+                        i += k + term_len;
                     }
                     b'7' => {
                         self.saved = self.cur;
