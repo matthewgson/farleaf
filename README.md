@@ -48,7 +48,7 @@ cp target/release/farleaf ~/.local/bin/
 ```sh
 farleaf paper.pdf
 farleaf -p 12 paper.pdf      # open at page 12
-farleaf -p 12:340 paper.pdf  # ... with the spot 340 pt from its top a third of the way down
+farleaf -p 12:340:96 paper.pdf  # ... with the spot 340 pt down, 96 across, a third of the way down
 farleaf docs/demo/demo.pdf   # the paper in the GIF, in a clone of this repo
 ```
 
@@ -72,25 +72,49 @@ Press `?` for the list of keys. A count works before most keys: `5j`, `3l`, `12G
 | `o` | the outline (contents) in a sidebar; again to hide it |
 | `t` | page thumbnails in a sidebar; again to hide them |
 | in the sidebar: `j` `k`, `Enter`, `Esc` | move (the page follows), stay there, go back to where you were |
-| `:12` `:12:340` `:q` `:noh` `:e` | go to page 12 (at 340 pt from its top), quit, clear highlights, reload |
+| `:12` `:12:340:96` `:q` `:noh` `:e` | go to page 12 (at 340 pt from its top, 96 across), quit, clear highlights, reload |
 | `Ctrl`-click, `gd` | LaTeX: the source of the line clicked, or of the search match or the line a third of the way down (see below) |
-| `v` `V` | visual mode: select text by characters / lines, `y` copies, `gd` goes to the source (see below) |
+| `v` `V` | visual mode: a text cursor (`v`), then select by characters / lines, `y` copies, `gd` goes to the source (see below) |
 | `r` | reload |
 | `?`, `:help` | the key list |
 | `q`, `Ctrl-c` | quit |
 
+### The status line
+
+The bottom line is drawn like Neovim's in LazyVim (lualine, tokyonight
+colors): the mode on the left (`NORMAL`, `CURSOR`, `VISUAL`, `V-LINE`,
+`COMMAND` while typing after `:` or `/`, `OUTLINE` and `PAGES` in the
+sidebar), the file, then a message or the keys that work now. On the right,
+as Vim's showcmd, the keys of a command that waits for more (`12`, `g`,
+`2y`, `f`), then the view, how far down (`Top`, `42%`, `Bot`) and the page.
+The separators are Nerd Font glyphs, which Ghostty has built in.
+
 ### Visual mode
 
-`v` puts a cursor on the text (at the search match or SyncTeX spot if there is
-one, else the line a third of the way down); `V` selects whole lines. Move
-with `h j k l`, `w b e`, `0 ^ $`, `{ }`, `Ctrl-d/u/f/b`, with counts; `o`
-swaps the ends, `n`/`N` follow search matches, `Esc` leaves.
+`v` puts a text cursor on the page, with nothing selected yet (`CURSOR` in
+the status line, like Vim's normal mode): where a forward search (SyncTeX) just went, else
+where it was when you last left visual mode if that still shows, else on the
+search match, else at the start of the third line of text from the top of the
+screen. `v` again starts selecting from the cursor (`VISUAL`), `V` by whole
+lines (`V-LINE`); `v` once more stops selecting, or, if you have not moved since
+starting, leaves. `Esc` leaves at any time.
 
-- `y` copies to the system clipboard, as in LazyVim, and leaves. It uses
-  OSC 52, the way Neovim does over SSH, so it reaches the clipboard of the
-  machine you sit at (Ghostty, through herdr and SSH) with nothing installed
-  on the remote side. By characters, the lines of a paragraph run together
-  and a word broken by a hyphen is mended; `Y` or `V` copies lines as they are.
+The cursor moves as in Vim, with counts: `h j k l`, `w b e` and `W B E`,
+`0 ^ $`, `{ }`, `f F t T` and `; ,` along the line, `gg G` (`5G`: page 5),
+`H M L` on the screen, `Ctrl-d/u/f/b`; `n`/`N` follow search matches. While
+selecting, `o` swaps the ends; `iw aw iW aW` select a word (with just the
+cursor they start selecting it, so `v` `iw` `y` copies the word). Lines are the
+lines you see: the cells of a table row, or the far-apart words of a
+justified line, are one line.
+
+- `y` copies the selection to the system clipboard and leaves the cursor at
+  its start, as in Vim; with just the cursor, `y` takes a motion or object
+  (`yy` or `Y` the line, `yw`, `y$`, `yt.`, `yiw`, ...). It uses OSC 52, the
+  way Neovim does over SSH, so it reaches the clipboard of the machine you
+  sit at (Ghostty, through herdr and SSH) with nothing installed on the
+  remote side. By characters, the lines of a paragraph run together and a
+  word broken by a hyphen is mended; by lines (`V`, `yy`), lines stay as they
+  are.
 - `gd` goes to the source line of the cursor's character (SyncTeX, set up
   below), and stays in visual mode.
 
@@ -99,10 +123,13 @@ swaps the ends, `n`/`N` follow search matches, `Esc` leaves.
 Run LaTeX with `-synctex=1` (latexmk and VimTeX do) and farleaf goes both ways
 between the PDF and its source:
 
-- **Source to PDF.** `synctex view` gives a source line's page and height, so
-  an editor's forward search can open farleaf there (`farleaf -p 12:340
-  paper.pdf`) or type `:12:340` and Enter into a farleaf that is already open.
-  The line lands a third of the way down the screen.
+- **Source to PDF.** `synctex view` gives a source line's page, height and
+  place across, so an editor's forward search can open farleaf there
+  (`farleaf -p 12:340:96 paper.pdf`) or type `:12:340:96` and Enter into a
+  farleaf that is already open. The line lands a third of the way down the
+  screen, with the text cursor (visual mode, `CURSOR`) on the word where the
+  source line starts, near enough: SyncTeX knows boxes, not letters. `gd`
+  goes back, `v` selects from there, `Esc` leaves.
 - **PDF to source.** Ctrl-click a line, or press `gd` for the current search
   match or else the line a third of the way down (so `gd` right after a
   forward search goes back to the same line). Right-click works as Ctrl-click,

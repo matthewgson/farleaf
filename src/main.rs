@@ -28,6 +28,7 @@ fn debug_crc(rgb: &[u8]) -> u32 {
     c.sum()
 }
 
+mod bar;
 mod bench;
 mod encode;
 mod layout;
@@ -80,16 +81,20 @@ const KEYS: &[(&str, &str)] = &[
     ("o", "outline (contents); again to hide"),
     ("t", "page thumbnails; again to hide"),
     ("j k  Enter  Esc", "in the sidebar: move, go there, go back"),
-    ("", "Visual mode (select text, copy)"),
-    ("v  V", "select by characters / lines; again to leave"),
-    ("h j k l  w b e  0 ^ $  { }", "move the cursor (counts work)"),
+    ("", "Visual mode (a text cursor; select, copy)"),
+    ("v", "a cursor on the text; v again selects from there"),
+    ("v  V (selecting)", "stop selecting (unmoved: leave); V by lines"),
+    ("h j k l  w b e  W B E", "move the cursor (counts work)"),
+    ("0 ^ $  { }  gg G  H M L", "line, paragraph, document, screen"),
+    ("f F t T x  ; ,", "to the next x on the line (t: before it); again"),
     ("Ctrl-d Ctrl-u Ctrl-f Ctrl-b", "move the cursor a half / a whole screen"),
-    ("o", "the other end of the selection"),
-    ("y  Y", "copy to the system clipboard (also over SSH), leave"),
+    ("iw aw iW aW  o", "select a word (a: with its space); other end"),
+    ("y  Y", "selecting: copy (also over SSH); the cursor stays"),
+    ("yy  yw  y$  yiw  yfx", "cursor: copy the line, or up to a motion"),
     ("gd", "the source of the cursor's line, in the editor"),
     ("Esc", "leave visual mode"),
     ("", "LaTeX (SyncTeX)"),
-    (":12:340", "page 12, 340 pt from its top"),
+    (":12:340:96", "page 12, 340 pt down: the text cursor on that line"),
     ("Ctrl-click", "the source of the line clicked, in the editor"),
     ("gd", "... of the match, or the line a third down"),
     ("", "Other"),
@@ -102,9 +107,10 @@ const COUNT_NOTE: &str = "A count works before most keys: 5j, 3l, 12G.";
 
 fn usage() -> String {
     let mut s = String::from(
-        "usage: farleaf [-p PAGE[:Y]] FILE.pdf\n  \
+        "usage: farleaf [-p PAGE[:Y[:X]]] FILE.pdf\n  \
          (Y: a height on the page, in points from its top, shown a third of the\n  \
-         way down the screen; `synctex view` gives it. `:PAGE:Y` too.)\n",
+         way down the screen, with the text cursor on the word at X, points from\n  \
+         the left; `synctex view` gives them. `:PAGE:Y:X` too.)\n",
     );
     for (keys, what) in KEYS {
         if keys.is_empty() {
@@ -182,14 +188,24 @@ fn main() {
     }
 }
 
-/// "12" or "12:340.5": a page (from 1, returned from 0), and maybe a height
-/// on it, in points from its top.
-fn spot(s: &str) -> Option<(usize, Option<f32>)> {
-    let (p, y) = match s.split_once(':') {
-        Some((p, y)) => (p, Some(y.parse::<f32>().ok().filter(|y| y.is_finite())?)),
-        None => (s, None),
-    };
-    Some((p.parse::<usize>().ok()?.max(1) - 1, y))
+/// A page (from 1, returned from 0), and maybe a height on it and a place
+/// across, in points from its top left: "12", "12:340.5", "12:340.5:96"
+/// (`synctex view` gives all three).
+type Spot = (usize, Option<f32>, Option<f32>);
+
+fn spot(s: &str) -> Option<Spot> {
+    let mut parts = s.split(':');
+    let p = parts.next()?.parse::<usize>().ok()?.max(1) - 1;
+    let mut nums = Vec::new();
+    for v in parts {
+        nums.push(v.parse::<f32>().ok().filter(|v| v.is_finite())?);
+    }
+    match nums[..] {
+        [] => Some((p, None, None)),
+        [y] => Some((p, Some(y), None)),
+        [y, x] => Some((p, Some(y), Some(x))),
+        _ => None,
+    }
 }
 
 fn fail(msg: &str) -> ! {
@@ -263,7 +279,7 @@ fn probe(tty: &mut Tty, parser: &mut Parser, try_shm: bool) -> Probe {
     p
 }
 
-fn run(path: PathBuf, start: Option<(usize, Option<f32>)>) -> Result<(), String> {
+fn run(path: PathBuf, start: Option<Spot>) -> Result<(), String> {
     let (wake_r, wake_w) = term::wake_pipe().map_err(|e| e.to_string())?;
     let (tx, rx) = channel();
     let worker = Worker::spawn(path.clone(), tx.clone(), wake_w);
@@ -339,8 +355,8 @@ fn run(path: PathBuf, start: Option<(usize, Option<f32>)>) -> Result<(), String>
     );
     app.herdr = herdr;
     app.sync_mouse();
-    if let Some((p, y)) = start {
-        app.goto_spot(p, y, false);
+    if let Some((p, y, x)) = start {
+        app.goto_spot(p, y, x, false);
     }
     for i in probe.early {
         app.input(i);
@@ -435,8 +451,9 @@ struct App {
     /// Mouse reporting is on: the PDF has SyncTeX data.
     mouse: bool,
     /// The view's top after the last `:PAGE:Y`, and the spot it went to
-    /// (page, fraction of its height): `gd` goes back from there.
-    spot: Option<(u32, usize, f32)>,
+    /// (page, fraction of its height, and across if SyncTeX said): `gd` goes
+    /// back from there, and visual mode starts there.
+    spot: Option<(u32, usize, f32, Option<f32>)>,
     worker: Worker,
     writer: Option<Writer>,
     transport: Transport,
@@ -498,6 +515,10 @@ struct App {
     texts: visual::Texts,
     text_asked: HashSet<usize>,
     entering: Option<vmode::Entering>,
+    /// What visual mode paints on each page it touches (see `visual_ver`),
+    /// and where its cursor was when it was last left (page, character box).
+    vpaint: HashMap<usize, vmode::Paint>,
+    vlast: Option<(usize, [f32; 4])>,
     marks: HashMap<char, Pos>,
     jumps: Vec<Pos>,
     jump_at: usize,
@@ -623,6 +644,8 @@ impl App {
             texts: HashMap::new(),
             text_asked: HashSet::new(),
             entering: None,
+            vpaint: HashMap::new(),
+            vlast: None,
             marks: HashMap::new(),
             jumps: Vec::new(),
             jump_at: 0,
@@ -815,7 +838,7 @@ impl App {
                 false => b.cols as f32 / 2.0,
             }
         };
-        if let Some((top, p, fy)) = self.spot {
+        if let Some((top, p, fy, _)) = self.spot {
             if top == self.top && p < self.layout.pages.len() {
                 return (p, self.layout.frac_at(p, mid(p), 0.0).0, fy, false);
             }
@@ -1057,7 +1080,10 @@ impl App {
 
     /// Page `p`, and with `y` (points from the page's top) that height a third
     /// of the way down the screen: where SyncTeX says a line of source is.
-    fn goto_spot(&mut self, p: usize, y: Option<f32>, jump: bool) {
+    /// The text cursor goes there too (visual mode, just the cursor), on
+    /// the word at `x` (points from the left), where SyncTeX says the
+    /// source line starts, or else at the start of the line.
+    fn goto_spot(&mut self, p: usize, y: Option<f32>, x: Option<f32>, jump: bool) {
         let Some(y) = y else { return self.goto_page(p, jump) };
         if jump {
             self.push_jump();
@@ -1070,7 +1096,13 @@ impl App {
         self.clamp();
         // A point above the baseline, inside the line, for `gd`.
         let above = ((y - 1.0) / self.sizes[p].1.max(1.0)).clamp(0.0, 1.0);
-        self.spot = Some((self.top, p, above));
+        let fx = x.map(|x| (x / self.sizes[p].0.max(1.0)).clamp(0.0, 1.0));
+        self.spot = Some((self.top, p, above, fx));
+        if self.visual.is_some() {
+            self.visual_exit();
+        }
+        self.vlast = None;
+        self.visual_enter(false);
     }
 
     fn page_step(&mut self, n: i64) {
@@ -1216,6 +1248,14 @@ impl App {
     // --- keys ------------------------------------------------------------------------
 
     fn key(&mut self, k: Key) {
+        let showcmd = (self.count, self.pending);
+        self.key_in(k);
+        if showcmd != (self.count, self.pending) {
+            self.dirty = true; // the status line shows them
+        }
+    }
+
+    fn key_in(&mut self, k: Key) {
         if self.prompt.is_some() {
             return self.prompt_key(k);
         }
@@ -1224,6 +1264,11 @@ impl App {
         }
         if let Some(p) = self.pending.take() {
             return self.pending_key(p, k);
+        }
+        // The character after `f` `t` (and `yf` ...) is that, never a count.
+        if self.visual.as_ref().is_some_and(|v| v.wants_char()) {
+            self.visual_key(k, None);
+            return;
         }
         if let Key::Char(c @ '0'..='9') = k {
             if c != '0' || self.count.is_some() {
@@ -1387,8 +1432,8 @@ impl App {
     }
 
     fn command(&mut self, cmd: &str) {
-        if let Some((p, y)) = spot(cmd) {
-            return self.goto_spot(p, y, true);
+        if let Some((p, y, x)) = spot(cmd) {
+            return self.goto_spot(p, y, x, true);
         }
         match cmd {
             "q" | "q!" | "quit" | "wq" | "x" => self.quit = true,
@@ -1800,6 +1845,7 @@ impl App {
         let b = self.layout.pages[p];
         let g = self.geom();
         self.search.cur = Some((p, i));
+        self.vlast = None; // the next `v` starts at the match
         self.push_jump();
         self.top = self.layout.row_in(p, r[1]).saturating_sub(g.rows / 3);
         if b.cols > g.cols {
@@ -1834,7 +1880,7 @@ impl App {
         StripKey {
             gen: self.gen,
             page: page as u32,
-            ver: self.page_ver[page],
+            ver: self.page_ver[page].wrapping_add(self.visual_ver(page, k)),
             k,
             t,
             thumb: false,
@@ -2114,6 +2160,31 @@ impl App {
         self.warm_more = more;
     }
 
+    /// An older version of piece `key` (same layout, page, strip and tile,
+    /// drawn before a highlight or the visual cursor changed) that the
+    /// terminal still holds: shown until the new one is there, so a page
+    /// being drawn again never goes blank. Kept from eviction meanwhile.
+    fn stale(&mut self, key: StripKey) -> Option<u32> {
+        let (k, id) = self
+            .strips
+            .iter()
+            .filter_map(|(k, st)| match st {
+                St::Shown { id, seen, .. }
+                    if (k.gen, k.page, k.k, k.t, k.thumb) == (key.gen, key.page, key.k, key.t, key.thumb) =>
+                {
+                    Some((*seen, *k, *id))
+                }
+                _ => None,
+            })
+            .max_by_key(|s| s.0)
+            .map(|(_, k, id)| (k, id))?;
+        if let Some(St::Shown { seen, .. }) = self.strips.get_mut(&k) {
+            *seen = self.tick;
+        }
+        self.on_screen.insert(k);
+        Some(id)
+    }
+
     fn frame(&mut self, vis: &[Visible], shown: &[ThumbAt]) {
         self.tick += 1;
         let mut out = Vec::with_capacity(4096);
@@ -2193,12 +2264,25 @@ impl App {
         });
         let pieces: Vec<(StripKey, Visible)> = pages.chain(thumbs).collect();
         let g = self.layout.geom;
+        // Pieces with nothing at all to show (not even an older version).
+        let mut blank = false;
         for (key, v) in pieces {
-            let Some(St::Shown { id, seen, .. }) = self.strips.get_mut(&key) else {
-                missing = true;
-                continue;
+            let id = match self.strips.get_mut(&key) {
+                Some(St::Shown { id, seen, .. }) => {
+                    *seen = self.tick;
+                    *id
+                }
+                _ => {
+                    missing = true;
+                    match self.stale(key) {
+                        Some(id) => id,
+                        None => {
+                            blank = true;
+                            continue;
+                        }
+                    }
+                }
             };
-            *seen = self.tick;
             let parts = match popup {
                 Some((hole, _)) => v.around(hole),
                 None => vec![v],
@@ -2214,7 +2298,7 @@ impl App {
                     false => self.layout.source(v),
                 };
                 let at = [v.screen_row, v.screen_col, sx, sy, sw, sh, v.c1 - v.c0, v.b - v.a];
-                now.insert((*id, n as u32 + 1), at);
+                now.insert((id, n as u32 + 1), at);
             }
         }
         for &(id, p) in self.placed.keys() {
@@ -2262,65 +2346,92 @@ impl App {
                 debug_log!("screen complete {:.1} ms after key", t.elapsed().as_secs_f64() * 1e3);
             }
         }
-        self.status(&mut out, missing);
+        self.status(&mut out, blank);
         out.extend_from_slice(b"\x1b[?2026l");
         self.writer().frame(out);
         self.dirty = false;
     }
 
+    /// The status line (see bar.rs): the mode, the file, a message or a
+    /// hint (or the `:` `/` being typed), the keys of a command waiting for
+    /// more, the view, how far down, the page.
     fn status(&self, out: &mut Vec<u8>, loading: bool) {
         let cols = self.screen.cols as usize;
-        let _ = write!(out, "\x1b[{};1H\x1b[0m\x1b[2K", self.screen.rows.max(1));
-        if let Some((kind, buf)) = &self.prompt {
-            let text: String = format!("{kind}{buf}")
-                .chars()
-                .rev()
-                .take(cols.saturating_sub(1))
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
-            let _ = write!(out, "{text}\x1b[?25h");
-            return;
-        }
+        let row = self.screen.rows.max(1);
         let page = self.layout.page_at(self.top) + 1;
-        let view = match (self.fit, (self.zoom * 100.0).round() as u32) {
+        let page = format!("{page}/{}", self.layout.pages.len());
+        let mut view = match (self.fit, (self.zoom * 100.0).round() as u32) {
             (Fit::Width, 100) => "width".to_string(),
             (Fit::Page, 100) => "page".to_string(),
             (Fit::Width, z) => format!("width {z}%"),
             (Fit::Page, z) => format!("page {z}%"),
         };
-        let mut right = format!("{page}/{}  {view}", self.layout.pages.len());
         if self.invert {
-            right.push_str("  inv");
+            view.push_str(" inv");
         }
-        if loading {
-            right.push_str("  …");
-        }
-        if let Some(c) = self.count {
-            right = format!("{c}  {right}");
-        }
-        let hint = match &self.side {
+        let max = self.layout.max_top();
+        let progress = match self.top {
+            _ if max == 0 => "All".to_string(),
+            0 => "Top".to_string(),
+            t if t >= max => "Bot".to_string(),
+            t => format!("{}%", t as u64 * 100 / max as u64),
+        };
+        // Vim's showcmd: a count and the keys of a command waiting for more.
+        let count = self.count.map(|c| c.to_string()).unwrap_or_default();
+        let showcmd = match self.visual.as_ref().filter(|v| !v.pend.is_empty()) {
+            Some(v) => format!(
+                "{}{}{count}",
+                v.pend_n.map(|n| n.to_string()).unwrap_or_default(),
+                v.pend
+            ),
+            None => format!("{count}{}", self.pending.map(String::from).unwrap_or_default()),
+        };
+        let side = match &self.side {
             Some(Side {
                 kind, focus: Some(_), ..
-            }) => Some(match kind {
-                Kind::Outline => "contents: j k to move, Enter to go, Esc to go back, o to hide",
-                Kind::Thumbs => "pages: j k to move, Enter to go, Esc to go back, t to hide",
-            }),
-            _ => self.visual.as_ref().map(|v| match v.line {
-                true => "-- VISUAL LINE --   y copy  gd source  o other end  Esc",
-                false => "-- VISUAL --   y copy  gd source  o other end  Esc",
-            }),
+            }) => Some(*kind),
+            _ => None,
         };
-        let left = match (&self.msg, hint) {
-            (Some((m, _)), _) => m.as_str(),
-            (None, Some(h)) => h,
-            (None, None) => self.name.as_str(),
+        let (mode, hint) = match (side, &self.visual) {
+            (Some(Kind::Outline), _) => (bar::OUTLINE, "j k move  Enter go  Esc back  o hide"),
+            (Some(Kind::Thumbs), _) => (bar::PAGES, "j k move  Enter go  Esc back  t hide"),
+            (None, Some(v)) => match (v.select, v.line) {
+                (false, _) => (bar::CURSOR, "v select  V lines  yy copy line  gd source  Esc leave"),
+                (true, true) => (bar::V_LINE, "y copy  o other end  gd source  V stop  Esc leave"),
+                (true, false) => (bar::VISUAL, "y copy  o other end  gd source  v stop  Esc leave"),
+            },
+            (None, None) => (bar::NORMAL, ""),
         };
-        let room = cols.saturating_sub(right.chars().count() + 2);
-        let left: String = left.chars().take(room).collect();
-        let pad = cols.saturating_sub(left.chars().count() + right.chars().count() + 1);
-        let _ = write!(out, "\x1b[?25l{left}{:pad$}\x1b[2m{right}\x1b[0m", "");
+        let typed;
+        let (mode, msg, msg_fg) = match (&self.prompt, &self.msg) {
+            (Some((kind, buf)), _) => {
+                typed = format!("{kind}{buf}");
+                (bar::COMMAND, typed.as_str(), bar::FG)
+            }
+            (None, Some((m, _))) => (mode, m.as_str(), bar::FG),
+            (None, None) => (mode, hint, bar::HINT),
+        };
+        let (line, at) = bar::render(
+            &bar::Bar {
+                mode,
+                file: &self.name,
+                msg,
+                msg_fg,
+                keep_end: self.prompt.is_some(),
+                showcmd: &showcmd,
+                busy: loading,
+                view: &view,
+                progress: &progress,
+                page: &page,
+            },
+            cols,
+        );
+        let _ = write!(out, "\x1b[{row};1H{line}");
+        match self.prompt {
+            Some(_) => write!(out, "\x1b[{row};{at}H\x1b[?25h"),
+            None => write!(out, "\x1b[?25l"),
+        }
+        .ok();
     }
 }
 
@@ -2367,9 +2478,12 @@ mod tests {
 
     #[test]
     fn spots() {
-        assert_eq!(spot("12"), Some((11, None)));
-        assert_eq!(spot("0"), Some((0, None)));
-        assert_eq!(spot("3:340.5"), Some((2, Some(340.5))));
+        assert_eq!(spot("12"), Some((11, None, None)));
+        assert_eq!(spot("0"), Some((0, None, None)));
+        assert_eq!(spot("3:340.5"), Some((2, Some(340.5), None)));
+        assert_eq!(spot("3:340.5:96"), Some((2, Some(340.5), Some(96.0))));
+        assert_eq!(spot("3:340.5:96:1"), None);
+        assert_eq!(spot("3:340.5:"), None);
         assert_eq!(spot("3:"), None);
         assert_eq!(spot("3:nan"), None);
         assert_eq!(spot("q"), None);

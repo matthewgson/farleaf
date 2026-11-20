@@ -114,6 +114,9 @@ pub struct Stats {
     pub evicted: usize,
     pub missing_places: usize,
     pub peak_mem: usize,
+    /// Blinks: the screen area under images went down and came back up
+    /// (a piece taken away before the one replacing it was there).
+    pub blinks: usize,
 }
 
 struct Loading {
@@ -147,6 +150,9 @@ pub struct Term {
     /// Bumped whenever what the screen shows changed (see `feed`).
     pub version: u64,
     view: u64,
+    /// Cells under images, as last seen, and whether that went down since.
+    area: i64,
+    dipped: bool,
     /// Inside a synchronized update (mode 2026).
     sync: bool,
     /// Whether text changes count as screen changes (not under herdr, which
@@ -180,6 +186,8 @@ impl Term {
             mem: 0,
             version: 0,
             view: 0,
+            area: 0,
+            dipped: false,
             sync: false,
             text_counts: true,
         }
@@ -524,6 +532,14 @@ impl Term {
             if h != self.view {
                 self.view = h;
                 self.version += 1;
+                let area: i64 = self.visible().iter().map(|(_, s)| s[2] * s[3]).sum();
+                if area < self.area {
+                    self.dipped = true;
+                } else if area > self.area && self.dipped {
+                    self.stats.blinks += 1;
+                    self.dipped = false;
+                }
+                self.area = area;
             }
         }
         rest
@@ -663,8 +679,23 @@ impl Term {
                 self.grid = vec![vec![BLANK; self.cols as usize]; self.rows as usize];
             }
             'K' => {
+                // Erase in line, filled with the current background (as
+                // terminals do): 0 from the cursor on, 1 up to it, 2 all.
                 let r = (self.cur.0.max(0) as usize).min(self.rows as usize - 1);
-                self.grid[r] = vec![BLANK; self.cols as usize];
+                let c = (self.cur.1.max(0) as usize).min(self.cols as usize);
+                let range = match first {
+                    Some(1) => 0..(c + 1).min(self.cols as usize),
+                    Some(2) => 0..self.cols as usize,
+                    _ => c..self.cols as usize,
+                };
+                let blank = Cell {
+                    ch: ' ',
+                    attr: Attr {
+                        bg: self.attr.bg,
+                        ..Attr::default()
+                    },
+                };
+                self.grid[r][range].fill(blank);
             }
             't' if first == Some(16) => {
                 self.replies

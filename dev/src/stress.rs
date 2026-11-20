@@ -71,6 +71,13 @@ fn session_steps(search: &str, reload: Box<dyn FnMut()>, cols: u32, rows: u32) -
     keys(&mut st, &["z", "-", "-", "-", "j", "l", "Z"]);
     keys(&mut st, &["i", "l", "i"]);
     keys(&mut st, &[&format!("/{search}\\r"), "n", "n", "N", "\\e"]);
+    // Visual mode: each cursor move draws again the strips it changes,
+    // showing the old ones until the new are there; leaving it shows the
+    // plain ones again. Esc, not y: herdr shows a notification over the
+    // pane when something is copied (OSC 52), which the checks would see.
+    keys(&mut st, &["v", "w", "w", "e", "j", "j", "^D", "b", "V", "\\e", "v"]);
+    st.push(Step::Burst(vec![keybytes("j"); 20], 0.05));
+    keys(&mut st, &["\\e"]);
     keys(&mut st, &["?", "j", "G", "?"]);
     // The sidebar: thumbnails (preview two pages on, go there), again (to the
     // end, then back), the outline instead, fit modes beside it, then hide it.

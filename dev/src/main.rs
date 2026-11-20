@@ -173,7 +173,7 @@ fn term(args: &[String]) -> Result<(), String> {
     }
     println!(
         "received {:.2} MB; {} uploads ({:.2} MB payload), {} placements, {} deletes, {} frames; refused {}, \
-         evicted {}, placed-but-missing {}; first image placed at {}",
+         evicted {}, placed-but-missing {}, blinks {}; first image placed at {}",
         s.bytes as f64 / 1e6,
         s.uploads,
         s.upload_bytes as f64 / 1e6,
@@ -183,6 +183,7 @@ fn term(args: &[String]) -> Result<(), String> {
         s.refused,
         s.evicted,
         s.missing_places,
+        s.blinks,
         res.first_image.map_or("-".into(), |t| format!("{t:.3} s"))
     );
     Ok(())
